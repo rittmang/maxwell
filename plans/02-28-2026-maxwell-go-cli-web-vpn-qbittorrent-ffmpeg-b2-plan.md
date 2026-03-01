@@ -38,13 +38,23 @@ Build a production-grade local orchestration service in Go that provides:
 - `Continue` (resume).
 - Action semantics:
 - torrent rows map to provider pause/resume by hash.
+- torrent rows expose `Open Folder` action (instead of rendering save path inline).
 - conversion/upload rows map to queue `paused <-> queued` transitions.
 - UI must expose actionable status feedback and refresh table state without requiring manual page reload.
+
+### 1.2) Active torrent ordering (qBittorrent-like)
+- Active torrent lane/list order must be deterministic:
+1. active/running.
+2. paused.
+3. completed.
+4. missing files.
+- Sorting should happen server-side for `/api/torrents` so all web refresh paths are consistent.
 
 ### 2) Add new magnet link via selected torrent integration
 - Submit magnet links through active torrent provider API.
 - Force downloads to preconfigured directory.
 - Reject or queue additions when VPN gate is in unsafe mode.
+- Web UI add-magnet input/button must be disabled whenever VPN state is not `SAFE`.
 
 ### 3) Conversion queue after download
 - On completed download, enqueue job for FFmpeg processing.
@@ -55,6 +65,9 @@ Build a production-grade local orchestration service in Go that provides:
 - Enqueue processed files for selected storage integration.
 - Emit final link after upload completes.
 - Persist results so links can be copied into downstream DB workflows.
+- Upload worker policy:
+- Conversion remains local and continues regardless of VPN state.
+- Upload dispatch is held unless VPN state is `UNSAFE`.
 
 ### 5) State-store backend abstraction
 - Queue/event/link persistence must be backend-agnostic.
@@ -235,6 +248,7 @@ Implementation details:
 - Add row-level context menu actions for torrent/conversion/upload entries (`pause`, `continue`).
 - Add CSRF-protected action endpoints:
 - `/api/torrents/action`.
+- `/api/torrents/open-folder`.
 - `/api/conversion/action`.
 - `/api/upload/action`.
 - Real-time updates over SSE.
@@ -243,6 +257,7 @@ Implementation details:
 Exit criteria:
 - Full browser workflow without refresh-dependent status.
 - Right-click actions mutate backend state and reflect in tables immediately.
+- Torrent context menu supports `Open Folder` and does not show path inline in card body.
 - Cards visibly move between Kanban lanes as pipeline stages complete.
 - Web/CLI parity integration tests pass for shared actions.
 
@@ -260,6 +275,9 @@ Exit criteria:
 Implementation details:
 - Unsafe/unknown states block magnet starts.
 - Mandatory pause-all while unsafe.
+- Upload worker gating:
+- `SAFE`/`UNKNOWN`: hold queued uploads (no upload dispatch).
+- `UNSAFE`: allow upload dispatch.
 - Optional startup `--require-safe-vpn`.
 - Debounce state flips to prevent pause/resume thrash.
 

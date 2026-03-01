@@ -5,7 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -34,6 +37,7 @@ type Service struct {
 	store     *queue.Store
 	bus       *events.Bus
 	now       func() time.Time
+	openDir   func(context.Context, string) error
 }
 
 func (s *Service) retryDecision(attempts int) (time.Time, bool) {
@@ -90,6 +94,7 @@ func NewService(dep Dependencies) (*Service, error) {
 		store:     dep.Store,
 		bus:       dep.Bus,
 		now:       time.Now,
+		openDir:   openFolderWithOS,
 	}, nil
 }
 
@@ -134,6 +139,63 @@ func (s *Service) ResumeTorrent(ctx context.Context, hash string) error {
 	_ = s.store.AddEvent(ctx, "info", "torrent_resumed", hash)
 	s.bus.Publish(events.Message{Type: "torrent_resumed", Body: hash})
 	return nil
+}
+
+func (s *Service) OpenTorrentFolder(ctx context.Context, hash string) error {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return fmt.Errorf("torrent hash is required")
+	}
+	list, err := s.torrents.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, t := range list {
+		if strings.TrimSpace(t.ID) != hash {
+			continue
+		}
+		openPath, err := resolveTorrentOpenPath(t.SavePath, t.Name, t.ContentPath)
+		if err != nil {
+			return fmt.Errorf("save path unavailable for torrent %s", hash)
+		}
+		if err := s.openDir(ctx, openPath); err != nil {
+			return err
+		}
+		_ = s.store.AddEvent(ctx, "info", "torrent_open_folder", openPath)
+		s.bus.Publish(events.Message{Type: "torrent_open_folder", Body: openPath})
+		return nil
+	}
+	return fmt.Errorf("torrent %s not found", hash)
+}
+
+func resolveTorrentOpenPath(savePath, torrentName, contentPath string) (string, error) {
+	basePath := strings.TrimSpace(savePath)
+	if basePath == "" {
+		return "", fmt.Errorf("save path is required")
+	}
+	content := strings.TrimSpace(contentPath)
+	if content != "" {
+		if info, err := os.Stat(content); err == nil {
+			if info.IsDir() {
+				return content, nil
+			}
+			return filepath.Dir(content), nil
+		}
+	}
+	name := strings.TrimSpace(torrentName)
+	if name == "" {
+		return basePath, nil
+	}
+	leaf := filepath.Base(name)
+	if leaf == "" || leaf == "." || leaf == string(filepath.Separator) {
+		return basePath, nil
+	}
+	candidate := filepath.Join(basePath, leaf)
+	info, err := os.Stat(candidate)
+	if err == nil && info.IsDir() {
+		return candidate, nil
+	}
+	return basePath, nil
 }
 
 func (s *Service) AddMagnet(ctx context.Context, magnet string) (string, error) {
@@ -267,6 +329,14 @@ func (s *Service) objectKeyForUpload(path string) string {
 }
 
 func (s *Service) processUploadOnce(ctx context.Context) error {
+	state, _, err := s.VPNStatus(ctx)
+	if err != nil {
+		return nil
+	}
+	if state != model.VPNStateUnsafe {
+		return nil
+	}
+
 	job, err := s.store.NextQueuedUpload(ctx)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -379,4 +449,24 @@ func (s *Service) ListEvents(ctx context.Context, limit int) ([]model.Event, err
 
 func (s *Service) Stats(ctx context.Context) (map[string]int64, error) {
 	return s.store.Stats(ctx)
+}
+
+func openFolderWithOS(ctx context.Context, path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("path is required")
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.CommandContext(ctx, "open", path)
+	case "windows":
+		cmd = exec.CommandContext(ctx, "explorer", path)
+	default:
+		cmd = exec.CommandContext(ctx, "xdg-open", path)
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("open folder %q: %w", path, err)
+	}
+	return nil
 }

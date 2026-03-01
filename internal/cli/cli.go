@@ -32,6 +32,7 @@ type ServiceAPI interface {
 	AddMagnet(context.Context, string) (string, error)
 	PauseTorrent(context.Context, string) error
 	ResumeTorrent(context.Context, string) error
+	OpenTorrentFolder(context.Context, string) error
 	SyncCompletedDownloads(context.Context) error
 	ProcessOnce(context.Context) error
 	ListConversionJobs(context.Context) ([]model.ConversionJob, error)

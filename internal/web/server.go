@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,7 @@ type Service interface {
 	AddMagnet(context.Context, string) (string, error)
 	PauseTorrent(context.Context, string) error
 	ResumeTorrent(context.Context, string) error
+	OpenTorrentFolder(context.Context, string) error
 	SyncCompletedDownloads(context.Context) error
 	ProcessOnce(context.Context) error
 	ListConversionJobs(context.Context) ([]model.ConversionJob, error)
@@ -71,6 +73,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/torrents", s.handleTorrents)
 	s.mux.HandleFunc("/api/torrents/add", s.handleAddTorrent)
 	s.mux.HandleFunc("/api/torrents/action", s.handleTorrentAction)
+	s.mux.HandleFunc("/api/torrents/open-folder", s.handleTorrentOpenFolder)
 	s.mux.HandleFunc("/api/run/once", s.handleRunOnce)
 	s.mux.HandleFunc("/api/queue", s.handleQueue)
 	s.mux.HandleFunc("/api/conversion/action", s.handleConversionAction)
@@ -121,7 +124,38 @@ func (s *Server) handleTorrents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	sortTorrentsForLane(list)
 	writeJSON(w, list)
+}
+
+func sortTorrentsForLane(list []model.Torrent) {
+	sort.SliceStable(list, func(i, j int) bool {
+		ri := torrentLaneRank(list[i])
+		rj := torrentLaneRank(list[j])
+		if ri != rj {
+			return ri < rj
+		}
+		ni := strings.ToLower(strings.TrimSpace(list[i].Name))
+		nj := strings.ToLower(strings.TrimSpace(list[j].Name))
+		if ni != nj {
+			return ni < nj
+		}
+		return list[i].ID < list[j].ID
+	})
+}
+
+func torrentLaneRank(t model.Torrent) int {
+	state := strings.ToLower(strings.TrimSpace(t.State))
+	if strings.Contains(state, "missing") {
+		return 3
+	}
+	if strings.Contains(state, "pause") || strings.Contains(state, "stopped") {
+		return 1
+	}
+	if strings.Contains(state, "complete") || t.Progress >= 0.999 {
+		return 2
+	}
+	return 0
 }
 
 func (s *Server) handleAddTorrent(w http.ResponseWriter, r *http.Request) {
@@ -182,6 +216,32 @@ func (s *Server) handleTorrentAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleTorrentOpenFolder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizeMutation(w, r) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	hash := strings.TrimSpace(r.Form.Get("hash"))
+	if hash == "" {
+		http.Error(w, "hash is required", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if err := s.svc.OpenTorrentFolder(ctx, hash); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -653,10 +713,30 @@ const indexHTML = `<!doctype html>
       border: 1px solid var(--border);
       border-radius: 10px;
       padding: 9px;
+      --fill-pct: 0%;
+      position: relative;
+      overflow: hidden;
       background: #ffffff;
       box-shadow: 0 3px 10px rgba(26,43,31,.08);
       display: grid;
       gap: 6px;
+      isolation: isolate;
+    }
+    .item-card::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: var(--fill-pct);
+      max-width: 100%;
+      background: linear-gradient(90deg, rgba(76, 175, 80, .48), rgba(31, 122, 77, .36));
+      z-index: 0;
+      pointer-events: none;
+    }
+    .item-card > * {
+      position: relative;
+      z-index: 1;
     }
     .item-card[data-row-kind] { cursor: context-menu; }
     .item-head {
@@ -789,7 +869,7 @@ const indexHTML = `<!doctype html>
         <h3>Add Magnet</h3>
         <form id="add-magnet-form">
           <textarea id="magnet-input" rows="4" placeholder="magnet:?xt=urn:btih:..."></textarea>
-          <button type="submit">Add Magnet</button>
+          <button id="add-magnet-btn" type="submit">Add Magnet</button>
         </form>
       </div>
 
@@ -824,6 +904,7 @@ const indexHTML = `<!doctype html>
     </div>
   </div>
   <div id="row-context-menu" class="context-menu" hidden>
+    <button type="button" data-action="open-folder">Open Folder</button>
     <button type="button" data-action="pause">Pause</button>
     <button type="button" data-action="resume">Continue</button>
   </div>
@@ -843,6 +924,7 @@ const indexHTML = `<!doctype html>
         status: document.getElementById('action-status'),
         addForm: document.getElementById('add-magnet-form'),
         magnetInput: document.getElementById('magnet-input'),
+        addMagnetBtn: document.getElementById('add-magnet-btn'),
         runBtn: document.getElementById('run-once-btn'),
         refreshBtn: document.getElementById('refresh-btn'),
         rowMenu: document.getElementById('row-context-menu'),
@@ -871,6 +953,14 @@ const indexHTML = `<!doctype html>
 
       function fmtNum(n) {
         return Number.isFinite(Number(n)) ? Number(n).toFixed(2) : '0.00';
+      }
+
+      function clampRatio(n) {
+        if (!Number.isFinite(Number(n))) return 0;
+        const v = Number(n);
+        if (v < 0) return 0;
+        if (v > 1) return 1;
+        return v;
       }
 
       function readCookie(name) {
@@ -903,12 +993,29 @@ const indexHTML = `<!doctype html>
         els.status.style.color = isErr ? '#b03a2e' : '#4a5a4e';
       }
 
+      function isVPNStateSafe(v) {
+        return String(v == null ? '' : v).trim().toUpperCase() === 'SAFE';
+      }
+
+      function syncMagnetControls(vpnState) {
+        const enabled = isVPNStateSafe(vpnState);
+        if (els.magnetInput) {
+          els.magnetInput.disabled = !enabled;
+          els.magnetInput.placeholder = enabled ? 'magnet:?xt=urn:btih:...' : 'VPN not SAFE; magnet add disabled';
+        }
+        if (els.addMagnetBtn) {
+          els.addMagnetBtn.disabled = !enabled;
+          els.addMagnetBtn.title = enabled ? '' : 'VPN must be SAFE to add magnets';
+        }
+      }
+
       function applyOverview(payload) {
         if (!payload || typeof payload !== 'object') return;
         if (payload.vpn && els.vpn) {
           const vpn = String(payload.vpn);
           els.vpn.textContent = vpn;
           els.vpn.dataset.state = vpn;
+          syncMagnetControls(vpn);
         }
         const stats = payload.stats || {};
         setText(els.downloads, stats.downloads || 0);
@@ -935,13 +1042,39 @@ const indexHTML = `<!doctype html>
         return '<div class="item-meta-line"><span class="item-meta-label">' + l + '</span><span class="item-meta-value" title="' + v + '">' + v + '</span></div>';
       }
 
-      function itemCard(kind, id, status, title, badge, metaLines) {
+      function progressLabel(ratio) {
+        return fmtNum(clampRatio(ratio) * 100) + '%';
+      }
+
+      function visibleFillRatio(ratio) {
+        const clamped = clampRatio(ratio);
+        if (clamped <= 0 || clamped >= 1) return clamped;
+        // Keep low, non-zero progress clearly visible on small cards.
+        return Math.max(clamped, 0.025);
+      }
+
+      function torrentProgressRatio(state, progress) {
+        const s = normalizeStatus(state);
+        if (s === 'pausedup') return 1;
+        return clampRatio(progress);
+      }
+
+      function queueProgressRatio(status) {
+        const s = normalizeStatus(status);
+        if (s === 'done' || s === 'failed') return 1;
+        if (s === 'running' || s === 'paused') return 0.5;
+        return 0;
+      }
+
+      function itemCard(kind, id, status, title, badge, metaLines, fillRatio) {
         const titleHTML = escapeHtml(title == null ? '' : title);
         const badgeHTML = escapeHtml(badge == null ? '' : badge);
+        const fillPct = progressLabel(visibleFillRatio(fillRatio));
+        const styleAttr = ' style="--fill-pct:' + escapeHtml(fillPct) + ';"';
         const attrs = kind && id
           ? ' data-row-kind="' + escapeHtml(kind) + '" data-row-id="' + escapeHtml(id) + '" data-row-status="' + escapeHtml(status || '') + '"'
           : '';
-        return '<article class="item-card"' + attrs + '>' +
+        return '<article class="item-card"' + attrs + styleAttr + '>' +
           '<div class="item-head">' +
             '<div class="item-title" title="' + titleHTML + '">' + titleHTML + '</div>' +
             '<span class="item-badge">' + badgeHTML + '</span>' +
@@ -959,6 +1092,15 @@ const indexHTML = `<!doctype html>
         return s.indexOf('pause') >= 0 || s.indexOf('stopped') >= 0;
       }
 
+      function torrentLaneRankFromState(state, progress) {
+        const s = normalizeStatus(state);
+        const p = Number(progress || 0);
+        if (s.indexOf('missing') >= 0) return 3;
+        if (s.indexOf('pause') >= 0 || s.indexOf('stopped') >= 0) return 1;
+        if (s.indexOf('complete') >= 0 || p >= 0.999) return 2;
+        return 0;
+      }
+
       function canPauseRow(ctx) {
         if (!ctx) return false;
         if (ctx.kind === 'torrent') return !isTorrentPausedState(ctx.status);
@@ -971,6 +1113,10 @@ const indexHTML = `<!doctype html>
         return ctx.status === 'paused';
       }
 
+      function canOpenFolder(ctx) {
+        return !!ctx && ctx.kind === 'torrent';
+      }
+
       function hideContextMenu() {
         if (!els.rowMenu) return;
         els.rowMenu.hidden = true;
@@ -980,8 +1126,10 @@ const indexHTML = `<!doctype html>
       function showContextMenu(x, y, ctx) {
         if (!els.rowMenu) return;
         rowActionContext = ctx;
+        const openBtn = els.rowMenu.querySelector('button[data-action="open-folder"]');
         const pauseBtn = els.rowMenu.querySelector('button[data-action="pause"]');
         const resumeBtn = els.rowMenu.querySelector('button[data-action="resume"]');
+        if (openBtn) openBtn.disabled = !canOpenFolder(ctx);
         if (pauseBtn) pauseBtn.disabled = !canPauseRow(ctx);
         if (resumeBtn) resumeBtn.disabled = !canResumeRow(ctx);
         els.rowMenu.hidden = false;
@@ -1007,6 +1155,7 @@ const indexHTML = `<!doctype html>
       function actionRequestForRow(ctx, action) {
         if (!ctx) return null;
         if (ctx.kind === 'torrent') {
+          if (action === 'open-folder') return { url: '/api/torrents/open-folder', body: { hash: ctx.id } };
           return { url: '/api/torrents/action', body: { hash: ctx.id, action: action } };
         }
         if (ctx.kind === 'conversion') {
@@ -1021,7 +1170,7 @@ const indexHTML = `<!doctype html>
       async function runRowAction(action, ctx) {
         const req = actionRequestForRow(ctx, action);
         if (!req) return;
-        const stateWord = action === 'pause' ? 'paused' : 'continued';
+        const stateWord = action === 'pause' ? 'paused' : action === 'resume' ? 'continued' : 'opened';
         setStatus(ctx.kind + ' ' + stateWord + '...', false);
         try {
           await postForm(req.url, req.body);
@@ -1033,12 +1182,22 @@ const indexHTML = `<!doctype html>
       }
 
       function renderTorrents(items) {
-        const list = items || [];
+        const list = (items || []).slice().sort(function (a, b) {
+          const ra = torrentLaneRankFromState(a.state, a.progress);
+          const rb = torrentLaneRankFromState(b.state, b.progress);
+          if (ra !== rb) return ra - rb;
+          const na = String(a.name || '').toLowerCase();
+          const nb = String(b.name || '').toLowerCase();
+          if (na < nb) return -1;
+          if (na > nb) return 1;
+          return String(a.id || '').localeCompare(String(b.id || ''));
+        });
         setText(els.torrentsCount, list.length);
         const cards = list.map(function (t) {
           const id = String(t.id || '');
           const state = String(t.state || '');
-          const pct = fmtNum((t.progress || 0) * 100) + '%';
+          const progress = torrentProgressRatio(state, t.progress);
+          const pct = progressLabel(progress);
           return itemCard(
             'torrent',
             id,
@@ -1048,9 +1207,9 @@ const indexHTML = `<!doctype html>
             [
               laneMetaLine('State', state || '-'),
               laneMetaLine('Speed', t.download_speed),
-              laneMetaLine('ETA', t.eta_seconds),
-              laneMetaLine('Path', t.save_path || '-')
-            ]
+              laneMetaLine('ETA', t.eta_seconds)
+            ],
+            progress
           );
         });
         renderLane(els.torrentsLane, cards, 'No active torrents');
@@ -1062,6 +1221,7 @@ const indexHTML = `<!doctype html>
         const cards = list.map(function (j) {
           const id = String(j.id || '');
           const status = normalizeStatus(j.status);
+          const progress = queueProgressRatio(status);
           return itemCard(
             'conversion',
             id,
@@ -1069,10 +1229,12 @@ const indexHTML = `<!doctype html>
             'Job #' + id,
             j.status || '-',
             [
+              laneMetaLine('Progress', progressLabel(progress)),
               laneMetaLine('Attempts', j.attempts),
               laneMetaLine('Input', j.input_path || '-'),
               laneMetaLine('Output', j.output_path || '-')
-            ]
+            ],
+            progress
           );
         });
         renderLane(els.convLane, cards, 'No conversion jobs');
@@ -1084,6 +1246,7 @@ const indexHTML = `<!doctype html>
         const cards = list.map(function (j) {
           const id = String(j.id || '');
           const status = normalizeStatus(j.status);
+          const progress = queueProgressRatio(status);
           return itemCard(
             'upload',
             id,
@@ -1091,10 +1254,12 @@ const indexHTML = `<!doctype html>
             'Job #' + id,
             j.status || '-',
             [
+              laneMetaLine('Progress', progressLabel(progress)),
               laneMetaLine('Attempts', j.attempts),
               laneMetaLine('Key', j.object_key || '-'),
               laneMetaLine('URL', j.final_url || '-')
-            ]
+            ],
+            progress
           );
         });
         renderLane(els.uploadLane, cards, 'No upload jobs');
@@ -1113,7 +1278,8 @@ const indexHTML = `<!doctype html>
             [
               laneMetaLine('URL', l.final_url || '-'),
               laneMetaLine('Created', l.created_at || '-')
-            ]
+            ],
+            0
           );
         });
         renderLane(els.linksLane, cards, 'No links emitted');
@@ -1131,7 +1297,8 @@ const indexHTML = `<!doctype html>
             [
               laneMetaLine('Message', e.message || '-'),
               laneMetaLine('At', e.created_at || '-')
-            ]
+            ],
+            0
           );
         });
         renderLane(els.eventsList, cards, 'No events yet');
@@ -1202,6 +1369,10 @@ const indexHTML = `<!doctype html>
       }
 
       async function addMagnet() {
+        if (els.addMagnetBtn && els.addMagnetBtn.disabled) {
+          setStatus('magnet add is disabled while VPN is not SAFE', true);
+          return;
+        }
         const magnet = (els.magnetInput.value || '').trim();
         if (!magnet) {
           setStatus('magnet is required', true);
@@ -1307,6 +1478,7 @@ const indexHTML = `<!doctype html>
       }
 
       fetchOverview();
+      syncMagnetControls(els.vpn ? els.vpn.textContent : '');
       refreshCollections();
       setInterval(refreshCollections, 5000);
       startSSE();

@@ -19,6 +19,7 @@ type Torrent struct {
 	ETASeconds    int64   `json:"eta_seconds"`
 	State         string  `json:"state"`
 	SavePath      string  `json:"save_path"`
+	ContentPath   string  `json:"content_path,omitempty"`
 	Completed     bool    `json:"completed"`
 }
 

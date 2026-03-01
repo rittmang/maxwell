@@ -136,6 +136,7 @@ func (c *QBitClient) List(ctx context.Context) ([]model.Torrent, error) {
 			ETASeconds:    t.ETA,
 			State:         t.State,
 			SavePath:      t.SavePath,
+			ContentPath:   t.ContentPath,
 			Completed:     completed,
 		})
 	}

@@ -38,6 +38,9 @@ func (f *fakeCLIService) AddMagnet(_ context.Context, magnet string) (string, er
 }
 func (f *fakeCLIService) PauseTorrent(context.Context, string) error  { return nil }
 func (f *fakeCLIService) ResumeTorrent(context.Context, string) error { return nil }
+func (f *fakeCLIService) OpenTorrentFolder(context.Context, string) error {
+	return nil
+}
 func (f *fakeCLIService) SyncCompletedDownloads(context.Context) error {
 	f.syncCalls++
 	return nil

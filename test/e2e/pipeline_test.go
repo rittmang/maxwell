@@ -116,9 +116,13 @@ database:
 		t.Fatalf("expected qb add endpoint to be called")
 	}
 
+	if err := os.Setenv("MAXWELL_VPN_FORCE_STATE", "UNSAFE"); err != nil {
+		t.Fatal(err)
+	}
+
 	stdout.Reset()
 	stderr.Reset()
-	code = r.Execute([]string{"--config", cfgPath, "run", "--cycles", "1"})
+	code = r.Execute([]string{"--config", cfgPath, "run", "--cycles", "1", "--require-safe-vpn=false"})
 	if code != 0 {
 		t.Fatalf("run failed (%d): %s", code, stderr.String())
 	}
@@ -131,6 +135,10 @@ database:
 	}
 	if !strings.Contains(stdout.String(), "https://cdn.example.com") {
 		t.Fatalf("expected final link output, got %s", stdout.String())
+	}
+
+	if err := os.Setenv("MAXWELL_VPN_FORCE_STATE", "SAFE"); err != nil {
+		t.Fatal(err)
 	}
 
 	svc, cfgLoaded, err := app.Build(cfgPath)

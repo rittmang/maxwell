@@ -164,7 +164,7 @@ func TestPipelineEndToEndInService(t *testing.T) {
 	cfg.Paths.ProcessedDir = processedDir
 	cfg.StateStore.DSN = filepath.Join(dir, "maxwell.db")
 	cfg.FFmpeg.Preset = "h264_1080p_fast"
-	svc := newService(t, fakeGate{state: model.VPNStateSafe}, ft, fakeUploader{urls: map[string]string{}}, cfg)
+	svc := newService(t, fakeGate{state: model.VPNStateUnsafe}, ft, fakeUploader{urls: map[string]string{}}, cfg)
 	defer svc.Close()
 
 	ctx := context.Background()
@@ -209,7 +209,7 @@ func TestConversionRetryAndRecovery(t *testing.T) {
 	conv := &flakyConverter{failUntil: 1}
 	svc, err := NewService(Dependencies{
 		Config:    cfg,
-		Gate:      fakeGate{state: model.VPNStateSafe},
+		Gate:      fakeGate{state: model.VPNStateUnsafe},
 		Torrents:  ft,
 		Uploader:  fakeUploader{urls: map[string]string{}},
 		Converter: conv,
@@ -246,6 +246,64 @@ func TestConversionRetryAndRecovery(t *testing.T) {
 	}
 	if len(links) != 1 {
 		t.Fatalf("expected successful retry to produce link")
+	}
+}
+
+func TestConversionContinuesWhileUploadHeldOnSafeVPN(t *testing.T) {
+	dir := t.TempDir()
+	downloadDir := filepath.Join(dir, "downloads")
+	processedDir := filepath.Join(dir, "processed")
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(processedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcFile := filepath.Join(downloadDir, "clip.mkv")
+	if err := os.WriteFile(srcFile, []byte("clip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ft := &fakeTorrent{
+		list: []model.Torrent{
+			{ID: "h-safe", Name: "clip.mkv", SavePath: downloadDir, Completed: true, Progress: 1},
+		},
+	}
+	cfg := config.Default()
+	cfg.Paths.ProcessedDir = processedDir
+	cfg.StateStore.DSN = filepath.Join(dir, "maxwell.db")
+
+	svc := newService(t, fakeGate{state: model.VPNStateSafe}, ft, fakeUploader{urls: map[string]string{}}, cfg)
+	defer svc.Close()
+
+	ctx := context.Background()
+	if err := svc.SyncCompletedDownloads(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ProcessOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	convJobs, err := svc.ListConversionJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(convJobs) != 1 || convJobs[0].Status != model.JobStatusDone {
+		t.Fatalf("expected conversion done while vpn safe, got %+v", convJobs)
+	}
+	uplJobs, err := svc.ListUploadJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uplJobs) != 1 || uplJobs[0].Status != model.JobStatusQueued {
+		t.Fatalf("expected queued upload while vpn safe, got %+v", uplJobs)
+	}
+	links, err := svc.ListLinks(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("expected no uploaded links while vpn safe, got %d", len(links))
 	}
 }
 
@@ -331,5 +389,111 @@ func TestPauseResumeItemControls(t *testing.T) {
 	}
 	if uploadJobs[0].Status != model.JobStatusQueued {
 		t.Fatalf("expected queued upload status, got %s", uploadJobs[0].Status)
+	}
+}
+
+func TestOpenTorrentFolder(t *testing.T) {
+	cfg := config.Default()
+	tmp := t.TempDir()
+	cfg.StateStore.DSN = filepath.Join(tmp, "maxwell.db")
+	cfg.Paths.ProcessedDir = filepath.Join(tmp, "processed")
+	_ = os.MkdirAll(cfg.Paths.ProcessedDir, 0o755)
+	saveDir := filepath.Join(tmp, "downloads")
+	torrentDir := filepath.Join(saveDir, "MoviePack")
+	if err := os.MkdirAll(torrentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ft := &fakeTorrent{
+		list: []model.Torrent{
+			{ID: "h-open", Name: "MoviePack", SavePath: saveDir},
+		},
+	}
+	svc := newService(t, fakeGate{state: model.VPNStateSafe}, ft, fakeUploader{urls: map[string]string{}}, cfg)
+	defer svc.Close()
+
+	var opened string
+	svc.openDir = func(_ context.Context, path string) error {
+		opened = path
+		return nil
+	}
+	if err := svc.OpenTorrentFolder(context.Background(), "h-open"); err != nil {
+		t.Fatalf("open torrent folder: %v", err)
+	}
+	if opened != torrentDir {
+		t.Fatalf("expected open path %q, got %q", torrentDir, opened)
+	}
+}
+
+func TestOpenTorrentFolderSingleFileFallsBackToSavePath(t *testing.T) {
+	cfg := config.Default()
+	tmp := t.TempDir()
+	cfg.StateStore.DSN = filepath.Join(tmp, "maxwell.db")
+	cfg.Paths.ProcessedDir = filepath.Join(tmp, "processed")
+	_ = os.MkdirAll(cfg.Paths.ProcessedDir, 0o755)
+	saveDir := filepath.Join(tmp, "downloads")
+	if err := os.MkdirAll(saveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(saveDir, "movie.mkv"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ft := &fakeTorrent{
+		list: []model.Torrent{
+			{ID: "h-open-file", Name: "movie.mkv", SavePath: saveDir, ContentPath: filepath.Join(saveDir, "movie.mkv")},
+		},
+	}
+	svc := newService(t, fakeGate{state: model.VPNStateSafe}, ft, fakeUploader{urls: map[string]string{}}, cfg)
+	defer svc.Close()
+
+	var opened string
+	svc.openDir = func(_ context.Context, path string) error {
+		opened = path
+		return nil
+	}
+	if err := svc.OpenTorrentFolder(context.Background(), "h-open-file"); err != nil {
+		t.Fatalf("open torrent folder: %v", err)
+	}
+	if opened != saveDir {
+		t.Fatalf("expected open path %q, got %q", saveDir, opened)
+	}
+}
+
+func TestOpenTorrentFolderPrefersExistingContentPathDirectory(t *testing.T) {
+	cfg := config.Default()
+	tmp := t.TempDir()
+	cfg.StateStore.DSN = filepath.Join(tmp, "maxwell.db")
+	cfg.Paths.ProcessedDir = filepath.Join(tmp, "processed")
+	_ = os.MkdirAll(cfg.Paths.ProcessedDir, 0o755)
+
+	saveDir := filepath.Join(tmp, "Movie-GG")
+	contentDir := filepath.Join(saveDir, "Salaam Bombay!.1988.1080p.MUBI.WEB-DL.AAC.2.0.x264-Telly")
+	if err := os.MkdirAll(contentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ft := &fakeTorrent{
+		list: []model.Torrent{
+			{
+				ID:          "h-salaam",
+				Name:        "Salaam Bombay!.1988.1080p.MUBI.WEB-DL.AAC.2.0.x264-Telly",
+				SavePath:    saveDir,
+				ContentPath: contentDir,
+			},
+		},
+	}
+	svc := newService(t, fakeGate{state: model.VPNStateSafe}, ft, fakeUploader{urls: map[string]string{}}, cfg)
+	defer svc.Close()
+
+	var opened string
+	svc.openDir = func(_ context.Context, path string) error {
+		opened = path
+		return nil
+	}
+	if err := svc.OpenTorrentFolder(context.Background(), "h-salaam"); err != nil {
+		t.Fatalf("open torrent folder: %v", err)
+	}
+	if opened != contentDir {
+		t.Fatalf("expected open path %q, got %q", contentDir, opened)
 	}
 }

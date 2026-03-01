@@ -26,10 +26,12 @@ type fakeService struct {
 	processCalls       int
 	pausedTorrentHash  string
 	resumedTorrentHash string
+	openedTorrentHash  string
 	pausedConvID       int64
 	resumedConvID      int64
 	pausedUploadID     int64
 	resumedUploadID    int64
+	torrents           []model.Torrent
 }
 
 func (f *fakeService) VPNStatus(context.Context) (model.VPNState, vpn.Signals, error) {
@@ -41,6 +43,9 @@ func (f *fakeService) Stats(context.Context) (map[string]int64, error) {
 }
 
 func (f *fakeService) ListTorrents(context.Context) ([]model.Torrent, error) {
+	if f.torrents != nil {
+		return f.torrents, nil
+	}
 	return []model.Torrent{{ID: "h1", Name: "movie.mkv", Progress: 0.9}}, nil
 }
 
@@ -56,6 +61,11 @@ func (f *fakeService) PauseTorrent(_ context.Context, hash string) error {
 
 func (f *fakeService) ResumeTorrent(_ context.Context, hash string) error {
 	f.resumedTorrentHash = hash
+	return nil
+}
+
+func (f *fakeService) OpenTorrentFolder(_ context.Context, hash string) error {
+	f.openedTorrentHash = hash
 	return nil
 }
 
@@ -135,6 +145,43 @@ func TestOverviewAPI(t *testing.T) {
 	}
 }
 
+func TestTorrentsAPISorting(t *testing.T) {
+	svc := &fakeService{
+		torrents: []model.Torrent{
+			{ID: "missing", Name: "d", State: "missingFiles", Progress: 0.0},
+			{ID: "completed", Name: "c", State: "completed", Progress: 1.0},
+			{ID: "paused", Name: "b", State: "pausedUP", Progress: 0.4},
+			{ID: "running", Name: "a", State: "downloading", Progress: 0.5},
+		},
+	}
+	server := NewServer(svc, "", false)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/torrents")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var out []model.Torrent
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 4 {
+		t.Fatalf("expected 4 torrents, got %d", len(out))
+	}
+	got := []string{out[0].ID, out[1].ID, out[2].ID, out[3].ID}
+	want := []string{"running", "paused", "completed", "missing"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("unexpected sort order got=%v want=%v", got, want)
+		}
+	}
+}
+
 func TestIndexContainsParityActions(t *testing.T) {
 	svc := &fakeService{}
 	server := NewServer(svc, "token", true)
@@ -154,7 +201,7 @@ func TestIndexContainsParityActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, mustContain := range []string{"add-magnet-form", "run-once-btn", "/api/torrents/add", "/api/run/once", "/api/torrents/action", "/api/conversion/action", "/api/upload/action", "row-context-menu", "pipeline-board", "lane-torrents", "lane-conversion", "lane-upload", "lane-links", "item-card", "function itemCard(", "function renderLane("} {
+	for _, mustContain := range []string{"add-magnet-form", "add-magnet-btn", "run-once-btn", "/api/torrents/add", "/api/run/once", "/api/torrents/action", "/api/torrents/open-folder", "/api/conversion/action", "/api/upload/action", "row-context-menu", "open-folder", "pipeline-board", "lane-torrents", "lane-conversion", "lane-upload", "lane-links", "item-card", "function itemCard(", "function renderLane(", "function syncMagnetControls("} {
 		if !strings.Contains(text, mustContain) {
 			t.Fatalf("index missing %q", mustContain)
 		}
@@ -401,13 +448,14 @@ func TestRowActionEndpoints(t *testing.T) {
 
 	post("/api/torrents/action", url.Values{"hash": []string{"hash-1"}, "action": []string{"pause"}})
 	post("/api/torrents/action", url.Values{"hash": []string{"hash-1"}, "action": []string{"resume"}})
+	post("/api/torrents/open-folder", url.Values{"hash": []string{"hash-1"}})
 	post("/api/conversion/action", url.Values{"id": []string{"7"}, "action": []string{"pause"}})
 	post("/api/conversion/action", url.Values{"id": []string{"7"}, "action": []string{"resume"}})
 	post("/api/upload/action", url.Values{"id": []string{"9"}, "action": []string{"pause"}})
 	post("/api/upload/action", url.Values{"id": []string{"9"}, "action": []string{"resume"}})
 
-	if svc.pausedTorrentHash != "hash-1" || svc.resumedTorrentHash != "hash-1" {
-		t.Fatalf("torrent action calls not captured: pause=%q resume=%q", svc.pausedTorrentHash, svc.resumedTorrentHash)
+	if svc.pausedTorrentHash != "hash-1" || svc.resumedTorrentHash != "hash-1" || svc.openedTorrentHash != "hash-1" {
+		t.Fatalf("torrent action calls not captured: pause=%q resume=%q open=%q", svc.pausedTorrentHash, svc.resumedTorrentHash, svc.openedTorrentHash)
 	}
 	if svc.pausedConvID != 7 || svc.resumedConvID != 7 {
 		t.Fatalf("conversion action calls not captured: pause=%d resume=%d", svc.pausedConvID, svc.resumedConvID)
