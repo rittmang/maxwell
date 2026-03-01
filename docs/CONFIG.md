@@ -19,6 +19,12 @@
 - `download_dir`: path where provider should save downloads
 - `category`: optional category/tag
 
+For local qBittorrent setup, you can auto-configure WebUI and `torrent.base_url` with:
+
+```bash
+maxwell --config ./config.yaml torrents setup-qbittorrent
+```
+
 ## `storage`
 - `provider`: `backblaze_b2` | `aws_s3` | `google_drive` | `onedrive`
 - `endpoint`: required for `backblaze_b2` and `aws_s3`

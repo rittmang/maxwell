@@ -59,6 +59,7 @@ func NewRunner(stdout, stderr io.Writer) *Runner {
 }
 
 func defaultBuilder(configPath string) (ServiceAPI, error) {
+	tryAutoSetupQBit(configPath)
 	svc, _, err := app.Build(configPath)
 	return svc, err
 }
@@ -285,8 +286,11 @@ func (r *Runner) cmdVPN(configPath string, args []string) int {
 
 func (r *Runner) cmdTorrents(configPath string, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(r.Stderr, "usage: maxwell torrents list|add <magnet>")
+		fmt.Fprintln(r.Stderr, "usage: maxwell torrents list|add <magnet>|setup-qbittorrent")
 		return 2
+	}
+	if args[0] == "setup-qbittorrent" {
+		return r.cmdTorrentsSetupQBit(configPath, args[1:])
 	}
 	svc, err := r.Build(configPath)
 	if err != nil {
@@ -302,7 +306,7 @@ func (r *Runner) cmdTorrents(configPath string, args []string) int {
 	case "list":
 		list, err := svc.ListTorrents(ctx)
 		if err != nil {
-			fmt.Fprintf(r.Stderr, "list torrents: %v\n", err)
+			fmt.Fprintf(r.Stderr, "list torrents: %v\n", hintConnErr(err))
 			return 1
 		}
 		for _, t := range list {
@@ -316,13 +320,13 @@ func (r *Runner) cmdTorrents(configPath string, args []string) int {
 		}
 		id, err := svc.AddMagnet(ctx, args[1])
 		if err != nil {
-			fmt.Fprintf(r.Stderr, "add magnet: %v\n", err)
+			fmt.Fprintf(r.Stderr, "add magnet: %v\n", hintConnErr(err))
 			return 1
 		}
 		fmt.Fprintf(r.Stdout, "added=%s\n", id)
 		return 0
 	default:
-		fmt.Fprintln(r.Stderr, "usage: maxwell torrents list|add <magnet>")
+		fmt.Fprintln(r.Stderr, "usage: maxwell torrents list|add <magnet>|setup-qbittorrent")
 		return 2
 	}
 }
@@ -447,6 +451,7 @@ func (r *Runner) printUsage() {
 	fmt.Fprintln(r.Stdout, "  vpn status")
 	fmt.Fprintln(r.Stdout, "  torrents list")
 	fmt.Fprintln(r.Stdout, "  torrents add <magnet>")
+	fmt.Fprintln(r.Stdout, "  torrents setup-qbittorrent [--port 8080 --start=true --verify=true]")
 	fmt.Fprintln(r.Stdout, "  queue [list]")
 	fmt.Fprintln(r.Stdout, "  links list [--latest]")
 	fmt.Fprintln(r.Stdout, "  web [--bind 127.0.0.1:7777]")
@@ -499,4 +504,12 @@ func checkTorrentAPI(cfg config.TorrentConfig) error {
 	defer cancel()
 	_, err = c.List(ctx)
 	return err
+}
+
+func hintConnErr(err error) string {
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "connection refused") || strings.Contains(strings.ToLower(msg), "no such host") {
+		return msg + " (check that your torrent client is running and torrent.base_url is correct; run `maxwell --config ./config.yaml torrents setup-qbittorrent` then `maxwell --config ./config.yaml doctor`)"
+	}
+	return msg
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"maxwell/internal/config"
 	"maxwell/internal/events"
 	"maxwell/internal/model"
 	"maxwell/internal/vpn"
@@ -172,5 +173,83 @@ database:
 	}
 	if !strings.Contains(out.String(), "doctor: ok") {
 		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestTorrentsSetupQBitWritesINIAndConfig(t *testing.T) {
+	tmp := t.TempDir()
+	iniPath := filepath.Join(tmp, "qBittorrent.ini")
+	cfgPath := filepath.Join(tmp, "config.yaml")
+	initialINI := `[Preferences]
+WebUI\Enabled=false
+WebUI\Address=*
+WebUI\Port=8090
+WebUI\LocalHostAuth=false
+`
+	if err := os.WriteFile(iniPath, []byte(initialINI), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	initialCfg := `
+torrent:
+  provider: qbittorrent
+  base_url: http://127.0.0.1:8080
+  download_dir: ./downloads
+storage:
+  provider: backblaze_b2
+  endpoint: http://127.0.0.1:9000
+  bucket: media
+paths:
+  processed_dir: ./processed
+workers:
+  conversion: 1
+  upload: 1
+  max_attempts: 3
+  backoff_seconds: 1
+state_store:
+  driver: sqlite
+  dsn: ./maxwell.db
+  max_open_conns: 1
+`
+	if err := os.WriteFile(cfgPath, []byte(initialCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	old := os.Getenv("MAXWELL_QBITTORRENT_INI")
+	t.Cleanup(func() { _ = os.Setenv("MAXWELL_QBITTORRENT_INI", old) })
+	if err := os.Setenv("MAXWELL_QBITTORRENT_INI", iniPath); err != nil {
+		t.Fatal(err)
+	}
+
+	r, out, errBuf := newTestRunner(&fakeCLIService{})
+	code := r.Execute([]string{"--config", cfgPath, "torrents", "setup-qbittorrent", "--verify=false", "--start=false"})
+	if code != 0 {
+		t.Fatalf("expected code 0, got %d: %s", code, errBuf.String())
+	}
+	if !strings.Contains(out.String(), "qbittorrent_setup=ok") {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+
+	b, err := os.ReadFile(iniPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	for _, want := range []string{
+		`WebUI\Enabled=true`,
+		`WebUI\Address=127.0.0.1`,
+		`WebUI\Port=8090`,
+		`WebUI\LocalHostAuth=false`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected ini to contain %q, got:\n%s", want, text)
+		}
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Torrent.BaseURL != "http://127.0.0.1:8090" {
+		t.Fatalf("unexpected base_url: %s", cfg.Torrent.BaseURL)
 	}
 }

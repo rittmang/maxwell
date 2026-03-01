@@ -74,3 +74,21 @@ func TestEffectiveStateStoreBackwardCompatibility(t *testing.T) {
 		t.Fatalf("unexpected dsn: %s", ss.DSN)
 	}
 }
+
+func TestSaveAndLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := Default()
+	cfg.Torrent.Provider = "qbittorrent"
+	cfg.Torrent.BaseURL = "http://127.0.0.1:8090"
+	if err := Save(path, cfg); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if loaded.Torrent.BaseURL != "http://127.0.0.1:8090" {
+		t.Fatalf("unexpected base_url: %s", loaded.Torrent.BaseURL)
+	}
+}

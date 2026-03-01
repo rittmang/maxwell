@@ -26,6 +26,12 @@ This implementation treats torrent and storage systems as pluggable integrations
 maxwell --config ./config.yaml doctor
 ```
 
+If you use qBittorrent locally and have not configured its WebUI yet, run:
+
+```bash
+maxwell --config ./config.yaml torrents setup-qbittorrent
+```
+
 3. Add a torrent magnet:
 
 ```bash
@@ -49,6 +55,24 @@ maxwell --config ./config.yaml links list
 ```bash
 maxwell --config ./config.yaml web
 ```
+
+Web dashboard now includes:
+- Add magnet action (same as `torrents add`)
+- Run-one-cycle action (same as `run --cycles 1`)
+- Live torrents/queue/links/events panes with auto refresh
+
+### qBittorrent one-shot setup
+
+`torrents setup-qbittorrent` will:
+- find qBittorrent preferences (`qBittorrent.ini`/`.conf`)
+- enable WebUI on localhost
+- set/update `torrent.base_url` in Maxwell config
+- optionally start qBittorrent and verify API reachability
+
+Options:
+- `--port <n>` override WebUI port
+- `--start=true|false` start qBittorrent app if needed (default true)
+- `--verify=true|false` verify API after setup (default true)
 
 7. Continuous daemon-style loop:
 

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,8 +20,10 @@ import (
 )
 
 type fakeService struct {
-	bus         *events.Bus
-	addedMagnet string
+	bus          *events.Bus
+	addedMagnet  string
+	syncCalls    int
+	processCalls int
 }
 
 func (f *fakeService) VPNStatus(context.Context) (model.VPNState, vpn.Signals, error) {
@@ -37,6 +41,16 @@ func (f *fakeService) ListTorrents(context.Context) ([]model.Torrent, error) {
 func (f *fakeService) AddMagnet(_ context.Context, magnet string) (string, error) {
 	f.addedMagnet = magnet
 	return "added-id", nil
+}
+
+func (f *fakeService) SyncCompletedDownloads(context.Context) error {
+	f.syncCalls++
+	return nil
+}
+
+func (f *fakeService) ProcessOnce(context.Context) error {
+	f.processCalls++
+	return nil
 }
 
 func (f *fakeService) ListConversionJobs(context.Context) ([]model.ConversionJob, error) {
@@ -82,6 +96,32 @@ func TestOverviewAPI(t *testing.T) {
 	}
 	if body["vpn"] != string(model.VPNStateSafe) {
 		t.Fatalf("unexpected vpn state: %v", body["vpn"])
+	}
+}
+
+func TestIndexContainsParityActions(t *testing.T) {
+	svc := &fakeService{}
+	server := NewServer(svc, "token", true)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, mustContain := range []string{"add-magnet-form", "run-once-btn", "/api/torrents/add", "/api/run/once", "panel-wide", "torrent-table"} {
+		if !strings.Contains(text, mustContain) {
+			t.Fatalf("index missing %q", mustContain)
+		}
 	}
 }
 
@@ -131,6 +171,59 @@ func TestAddTorrentRequiresToken(t *testing.T) {
 	}
 	if svc.addedMagnet == "" {
 		t.Fatalf("expected magnet to be added")
+	}
+}
+
+func TestAddTorrentWithRenderedCSRFToken(t *testing.T) {
+	svc := &fakeService{}
+	server := NewServer(svc, "secret", true)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	getResp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer getResp.Body.Close()
+	body, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var csrfCookie *http.Cookie
+	for _, c := range getResp.Cookies() {
+		if c.Name == "maxwell_csrf" {
+			csrfCookie = c
+			break
+		}
+	}
+	if csrfCookie == nil || strings.TrimSpace(csrfCookie.Value) == "" {
+		t.Fatalf("expected maxwell_csrf cookie on index response")
+	}
+
+	apiToken := extractJSConstString(t, string(body), "apiToken")
+	if apiToken != "secret" {
+		t.Fatalf("expected apiToken to be rendered, got %q", apiToken)
+	}
+	csrfToken := extractJSConstString(t, string(body), "initialCSRFToken")
+	if csrfToken != csrfCookie.Value {
+		t.Fatalf("rendered csrf token mismatch: token=%q cookie=%q", csrfToken, csrfCookie.Value)
+	}
+
+	form := url.Values{"magnet": []string{"magnet:?xt=urn:btih:abc"}}
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/torrents/add", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-API-Token", apiToken)
+	req.Header.Set("X-CSRF-Token", csrfToken)
+	req.AddCookie(csrfCookie)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(b))
 	}
 }
 
@@ -216,6 +309,30 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestRunOnceEndpoint(t *testing.T) {
+	svc := &fakeService{}
+	server := NewServer(svc, "secret", true)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/run/once", strings.NewReader("csrf_token=csrf-token"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-API-Token", "secret")
+	req.Header.Set("X-CSRF-Token", "csrf-token")
+	req.AddCookie(&http.Cookie{Name: "maxwell_csrf", Value: "csrf-token"})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if svc.syncCalls != 1 || svc.processCalls != 1 {
+		t.Fatalf("expected one sync and process call, got sync=%d process=%d", svc.syncCalls, svc.processCalls)
+	}
+}
+
 func readSSEEvent(r *bufio.Reader) (string, string, error) {
 	event := ""
 	data := ""
@@ -240,4 +357,18 @@ func readSSEEvent(r *bufio.Reader) (string, string, error) {
 			continue
 		}
 	}
+}
+
+func extractJSConstString(t *testing.T, html, name string) string {
+	t.Helper()
+	re := regexp.MustCompile(`const\s+` + regexp.QuoteMeta(name) + `\s*=\s*("(?:[^"\\]|\\.)*");`)
+	match := re.FindStringSubmatch(html)
+	if len(match) < 2 {
+		t.Fatalf("missing JS const %q", name)
+	}
+	value, err := strconv.Unquote(match[1])
+	if err != nil {
+		t.Fatalf("invalid quoted const %q: %v", name, err)
+	}
+	return value
 }

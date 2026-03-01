@@ -160,6 +160,23 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+func Save(path string, cfg Config) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("config path is required")
+	}
+	b, err := yaml.Marshal(&cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config yaml: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
 func (c Config) Validate() error {
 	var errs []string
 

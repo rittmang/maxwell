@@ -26,6 +26,8 @@ type Service interface {
 	Stats(context.Context) (map[string]int64, error)
 	ListTorrents(context.Context) ([]model.Torrent, error)
 	AddMagnet(context.Context, string) (string, error)
+	SyncCompletedDownloads(context.Context) error
+	ProcessOnce(context.Context) error
 	ListConversionJobs(context.Context) ([]model.ConversionJob, error)
 	ListUploadJobs(context.Context) ([]model.UploadJob, error)
 	ListLinks(context.Context, int) ([]model.LinkRecord, error)
@@ -61,6 +63,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/overview", s.handleOverview)
 	s.mux.HandleFunc("/api/torrents", s.handleTorrents)
 	s.mux.HandleFunc("/api/torrents/add", s.handleAddTorrent)
+	s.mux.HandleFunc("/api/run/once", s.handleRunOnce)
 	s.mux.HandleFunc("/api/queue", s.handleQueue)
 	s.mux.HandleFunc("/api/links", s.handleLinks)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
@@ -73,12 +76,15 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	vpnState, _, _ := s.svc.VPNStatus(ctx)
 	stats, _ := s.svc.Stats(ctx)
+	csrfToken := ""
 	if s.csrfEnabled {
-		s.ensureCSRFCookie(w, r)
+		csrfToken = s.ensureCSRFCookie(w, r)
 	}
 	_ = s.tmpl.Execute(w, map[string]any{
-		"VPN":   vpnState,
-		"Stats": stats,
+		"VPN":       vpnState,
+		"Stats":     stats,
+		"APIToken":  s.token,
+		"CSRFToken": csrfToken,
 	})
 }
 
@@ -113,19 +119,14 @@ func (s *Server) handleAddTorrent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.token != "" && r.Header.Get("X-API-Token") != s.token {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if s.csrfEnabled && !s.validCSRF(r) {
-		http.Error(w, "csrf check failed", http.StatusForbidden)
+	if !s.authorizeMutation(w, r) {
 		return
 	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	magnet := r.Form.Get("magnet")
+	magnet := strings.TrimSpace(r.Form.Get("magnet"))
 	if magnet == "" {
 		http.Error(w, "magnet is required", http.StatusBadRequest)
 		return
@@ -138,6 +139,27 @@ func (s *Server) handleAddTorrent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"id": id})
+}
+
+func (s *Server) handleRunOnce(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizeMutation(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := s.svc.SyncCompletedDownloads(ctx); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.svc.ProcessOnce(ctx); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
@@ -289,18 +311,19 @@ func (s *Server) currentOverview(ctx context.Context) (map[string]any, error) {
 	}, nil
 }
 
-func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) {
-	if _, err := r.Cookie("maxwell_csrf"); err == nil {
-		return
+func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie("maxwell_csrf"); err == nil && strings.TrimSpace(c.Value) != "" {
+		return c.Value
 	}
 	token := randomHex(16)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "maxwell_csrf",
 		Value:    token,
 		Path:     "/",
-		HttpOnly: true,
+		HttpOnly: false,
 		SameSite: http.SameSiteLaxMode,
 	})
+	return token
 }
 
 func (s *Server) validCSRF(r *http.Request) bool {
@@ -314,6 +337,18 @@ func (s *Server) validCSRF(r *http.Request) bool {
 		header = strings.TrimSpace(r.Form.Get("csrf_token"))
 	}
 	return header != "" && header == cookie.Value
+}
+
+func (s *Server) authorizeMutation(w http.ResponseWriter, r *http.Request) bool {
+	if s.token != "" && r.Header.Get("X-API-Token") != s.token {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	if s.csrfEnabled && !s.validCSRF(r) {
+		http.Error(w, "csrf check failed", http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func randomHex(n int) string {
@@ -346,6 +381,7 @@ const indexHTML = `<!doctype html>
       --accent: #1f7a4d;
       --warn: #b03a2e;
       --muted: #4a5a4e;
+      --border: #d8e4dc;
     }
     body {
       margin: 0;
@@ -355,36 +391,123 @@ const indexHTML = `<!doctype html>
       min-height: 100vh;
     }
     .container {
-      max-width: 980px;
+      max-width: 1180px;
       margin: 24px auto;
-      padding: 0 16px;
+      padding: 0 16px 24px;
     }
-    .hero {
+    .hero, .panel {
       background: var(--card);
       border-radius: 14px;
-      padding: 20px;
+      padding: 16px;
       box-shadow: 0 8px 20px rgba(26,43,31,.08);
-      animation: fade .5s ease;
+      animation: fade .35s ease;
     }
     .hero h1 { margin: 0; letter-spacing: .06em; text-transform: uppercase; }
     .grid {
-      margin-top: 16px;
+      margin-top: 14px;
       display: grid;
-      grid-template-columns: repeat(auto-fit,minmax(210px,1fr));
-      gap: 12px;
+      grid-template-columns: repeat(auto-fit,minmax(190px,1fr));
+      gap: 10px;
     }
     .card {
-      background: var(--card);
-      border-radius: 12px;
-      padding: 12px;
-      box-shadow: 0 6px 14px rgba(26,43,31,.07);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
     }
     .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
     .value { font-size: 22px; margin-top: 8px; }
     #vpn-value[data-state="safe"], #vpn-value[data-state="SAFE"] { color: var(--accent); }
     #vpn-value[data-state="unsafe"], #vpn-value[data-state="UNSAFE"], #vpn-value[data-state="unknown"], #vpn-value[data-state="UNKNOWN"] { color: var(--warn); }
     .meta { margin-top: 10px; font-size: 12px; color: var(--muted); }
-    @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    .actions {
+      margin-top: 14px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    button {
+      background: #1f7a4d;
+      color: #fff;
+      border: 0;
+      padding: 8px 14px;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.secondary { background: #29493a; }
+    button:disabled { opacity: .7; cursor: not-allowed; }
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .panels {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit,minmax(420px,1fr));
+      gap: 10px;
+    }
+    .panel-wide {
+      grid-column: 1 / -1;
+    }
+    .panel h3 {
+      margin: 0 0 10px;
+      font-size: 16px;
+      letter-spacing: .01em;
+    }
+    form {
+      display: grid;
+      gap: 8px;
+    }
+    textarea, input {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px;
+      box-sizing: border-box;
+      font-family: inherit;
+      font-size: 14px;
+    }
+    .table-wrap {
+      overflow: auto;
+      max-height: 280px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      min-width: 680px;
+    }
+    table.torrent-table {
+      min-width: 980px;
+      table-layout: fixed;
+    }
+    table.torrent-table th:nth-child(1), table.torrent-table td:nth-child(1) { width: 260px; }
+    table.torrent-table th:nth-child(2), table.torrent-table td:nth-child(2) { width: 80px; }
+    table.torrent-table th:nth-child(3), table.torrent-table td:nth-child(3) { width: 90px; }
+    table.torrent-table th:nth-child(4), table.torrent-table td:nth-child(4) { width: 90px; }
+    table.torrent-table th:nth-child(5), table.torrent-table td:nth-child(5) { width: 120px; }
+    table.torrent-table th:nth-child(6), table.torrent-table td:nth-child(6) { width: 340px; }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 8px;
+      text-align: left;
+      white-space: nowrap;
+    }
+    th { background: #f0f6f2; position: sticky; top: 0; }
+    td.wrap { white-space: normal; word-break: break-word; }
+    .empty { color: var(--muted); padding: 10px; font-size: 13px; }
+    table.torrent-table td.wrap {
+      word-break: normal;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 980px) {
+      .panels { grid-template-columns: 1fr; }
+      .panel-wide { grid-column: auto; }
+    }
+    @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
   </style>
 </head>
 <body>
@@ -414,11 +537,89 @@ const indexHTML = `<!doctype html>
           <div class="value" id="links-value">{{index .Stats "links"}}</div>
         </div>
       </div>
+      <div class="actions">
+        <button id="run-once-btn" class="secondary">Run One Cycle</button>
+        <button id="refresh-btn" class="secondary">Refresh Now</button>
+        <span class="status" id="action-status">ready</span>
+      </div>
       <div class="meta">Live updates: <span id="live-status">connecting...</span> | Last update: <span id="updated-at">never</span></div>
+    </div>
+
+    <div class="panels">
+      <div class="panel">
+        <h3>Add Magnet</h3>
+        <form id="add-magnet-form">
+          <textarea id="magnet-input" rows="4" placeholder="magnet:?xt=urn:btih:..."></textarea>
+          <button type="submit">Add Magnet</button>
+        </form>
+      </div>
+
+      <div class="panel panel-wide">
+        <h3>Active Torrents</h3>
+        <div class="table-wrap">
+          <table class="torrent-table">
+            <thead>
+              <tr><th>Name</th><th>Progress</th><th>Speed</th><th>ETA</th><th>State</th><th>Path</th></tr>
+            </thead>
+            <tbody id="torrents-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Conversion Queue</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Status</th><th>Attempts</th><th>Input</th><th>Output</th></tr>
+            </thead>
+            <tbody id="conv-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Upload Queue</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Status</th><th>Attempts</th><th>Key</th><th>Final URL</th></tr>
+            </thead>
+            <tbody id="upload-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Links</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>File</th><th>URL</th><th>Created</th></tr>
+            </thead>
+            <tbody id="links-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Events</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>ID</th><th>Level</th><th>Type</th><th>Message</th><th>At</th></tr>
+            </thead>
+            <tbody id="events-body"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
   </div>
   <script>
     (function () {
+      const apiToken = {{.APIToken}};
+      const initialCSRFToken = {{.CSRFToken}};
+
       const els = {
         vpn: document.getElementById('vpn-value'),
         downloads: document.getElementById('downloads-value'),
@@ -426,11 +627,61 @@ const indexHTML = `<!doctype html>
         upload: document.getElementById('upload-value'),
         links: document.getElementById('links-value'),
         live: document.getElementById('live-status'),
-        updated: document.getElementById('updated-at')
+        updated: document.getElementById('updated-at'),
+        status: document.getElementById('action-status'),
+        addForm: document.getElementById('add-magnet-form'),
+        magnetInput: document.getElementById('magnet-input'),
+        runBtn: document.getElementById('run-once-btn'),
+        refreshBtn: document.getElementById('refresh-btn'),
+        torrentsBody: document.getElementById('torrents-body'),
+        convBody: document.getElementById('conv-body'),
+        uploadBody: document.getElementById('upload-body'),
+        linksBody: document.getElementById('links-body'),
+        eventsBody: document.getElementById('events-body')
       };
 
       function setText(el, value) {
         if (el) el.textContent = String(value ?? 0);
+      }
+
+      function escapeHtml(v) {
+        return String(v ?? '').replace(/[&<>"']/g, function (ch) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', '\'':'&#39;'})[ch];
+        });
+      }
+
+      function fmtNum(n) {
+        return Number.isFinite(Number(n)) ? Number(n).toFixed(2) : '0.00';
+      }
+
+      function readCookie(name) {
+        const prefix = name + '=';
+        const parts = String(document.cookie || '').split(';');
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i].trim();
+          if (part.indexOf(prefix) === 0) {
+            try { return decodeURIComponent(part.slice(prefix.length)); } catch (_) { return part.slice(prefix.length); }
+          }
+        }
+        return '';
+      }
+
+      function currentCSRFToken() {
+        return readCookie('maxwell_csrf') || initialCSRFToken || '';
+      }
+
+      function authHeaders() {
+        const h = {};
+        if (apiToken) h['X-API-Token'] = apiToken;
+        const csrf = currentCSRFToken();
+        if (csrf) h['X-CSRF-Token'] = csrf;
+        return h;
+      }
+
+      function setStatus(msg, isErr) {
+        if (!els.status) return;
+        els.status.textContent = msg;
+        els.status.style.color = isErr ? '#b03a2e' : '#4a5a4e';
       }
 
       function applyOverview(payload) {
@@ -438,7 +689,7 @@ const indexHTML = `<!doctype html>
         if (payload.vpn && els.vpn) {
           const vpn = String(payload.vpn);
           els.vpn.textContent = vpn;
-          els.vpn.dataset.state = vpn.toLowerCase();
+          els.vpn.dataset.state = vpn;
         }
         const stats = payload.stats || {};
         setText(els.downloads, stats.downloads || 0);
@@ -450,17 +701,165 @@ const indexHTML = `<!doctype html>
         }
       }
 
+      function renderRows(target, rows, emptyMsg) {
+        if (!target) return;
+        if (!rows || rows.length === 0) {
+          target.innerHTML = '<tr><td class="empty" colspan="8">' + escapeHtml(emptyMsg) + '</td></tr>';
+          return;
+        }
+        target.innerHTML = rows.join('');
+      }
+
+      function renderTorrents(items) {
+        const rows = (items || []).map(function (t) {
+          return '<tr>' +
+            '<td class="wrap">' + escapeHtml(t.name) + '</td>' +
+            '<td>' + escapeHtml(fmtNum((t.progress || 0) * 100)) + '%</td>' +
+            '<td>' + escapeHtml(t.download_speed) + '</td>' +
+            '<td>' + escapeHtml(t.eta_seconds) + '</td>' +
+            '<td>' + escapeHtml(t.state) + '</td>' +
+            '<td class="wrap">' + escapeHtml(t.save_path) + '</td>' +
+          '</tr>';
+        });
+        renderRows(els.torrentsBody, rows, 'No active torrents');
+      }
+
+      function renderConversion(items) {
+        const rows = (items || []).map(function (j) {
+          return '<tr>' +
+            '<td>' + escapeHtml(j.id) + '</td>' +
+            '<td>' + escapeHtml(j.status) + '</td>' +
+            '<td>' + escapeHtml(j.attempts) + '</td>' +
+            '<td class="wrap">' + escapeHtml(j.input_path) + '</td>' +
+            '<td class="wrap">' + escapeHtml(j.output_path) + '</td>' +
+          '</tr>';
+        });
+        renderRows(els.convBody, rows, 'No conversion jobs');
+      }
+
+      function renderUpload(items) {
+        const rows = (items || []).map(function (j) {
+          return '<tr>' +
+            '<td>' + escapeHtml(j.id) + '</td>' +
+            '<td>' + escapeHtml(j.status) + '</td>' +
+            '<td>' + escapeHtml(j.attempts) + '</td>' +
+            '<td class="wrap">' + escapeHtml(j.object_key) + '</td>' +
+            '<td class="wrap">' + escapeHtml(j.final_url || '') + '</td>' +
+          '</tr>';
+        });
+        renderRows(els.uploadBody, rows, 'No upload jobs');
+      }
+
+      function renderLinks(items) {
+        const rows = (items || []).map(function (l) {
+          return '<tr>' +
+            '<td>' + escapeHtml(l.id) + '</td>' +
+            '<td class="wrap">' + escapeHtml(l.file_path) + '</td>' +
+            '<td class="wrap"><a href="' + escapeHtml(l.final_url) + '" target="_blank" rel="noreferrer">' + escapeHtml(l.final_url) + '</a></td>' +
+            '<td>' + escapeHtml(l.created_at) + '</td>' +
+          '</tr>';
+        });
+        renderRows(els.linksBody, rows, 'No links emitted');
+      }
+
+      function renderEvents(items) {
+        const rows = (items || []).map(function (e) {
+          return '<tr>' +
+            '<td>' + escapeHtml(e.id) + '</td>' +
+            '<td>' + escapeHtml(e.level) + '</td>' +
+            '<td>' + escapeHtml(e.type) + '</td>' +
+            '<td class="wrap">' + escapeHtml(e.message) + '</td>' +
+            '<td>' + escapeHtml(e.created_at) + '</td>' +
+          '</tr>';
+        });
+        renderRows(els.eventsBody, rows, 'No events yet');
+      }
+
+      async function fetchJSON(url) {
+        const res = await fetch(url, { cache: 'no-store' });
+        const text = await res.text();
+        if (!res.ok) {
+          const msg = String(text || '').trim();
+          if (msg) throw new Error(msg);
+          throw new Error('HTTP ' + res.status + ' for ' + url);
+        }
+        if (!text) return {};
+        return JSON.parse(text);
+      }
+
       async function fetchOverview() {
         try {
-          const res = await fetch('/api/overview', { cache: 'no-store' });
-          if (!res.ok) return;
-          applyOverview(await res.json());
+          applyOverview(await fetchJSON('/api/overview'));
         } catch (_) {}
+      }
+
+      async function refreshCollections() {
+        try {
+          const [torrents, queue, links, events] = await Promise.all([
+            fetchJSON('/api/torrents'),
+            fetchJSON('/api/queue'),
+            fetchJSON('/api/links'),
+            fetchJSON('/api/events')
+          ]);
+          renderTorrents(torrents);
+          renderConversion(queue.conversion || []);
+          renderUpload(queue.upload || []);
+          renderLinks(links);
+          renderEvents(events);
+        } catch (err) {
+          setStatus(err.message || String(err), true);
+        }
+      }
+
+      async function postForm(url, bodyObj) {
+        const body = new URLSearchParams(bodyObj || {});
+        if (!body.has('csrf_token')) {
+          const csrf = currentCSRFToken();
+          if (csrf) body.set('csrf_token', csrf);
+        }
+        const headers = Object.assign({'Content-Type': 'application/x-www-form-urlencoded'}, authHeaders());
+        const res = await fetch(url, { method: 'POST', headers: headers, body: body.toString() });
+        if (!res.ok) {
+          throw new Error(await res.text() || ('HTTP ' + res.status));
+        }
+        return res.json();
+      }
+
+      async function runOnce() {
+        els.runBtn.disabled = true;
+        setStatus('running one cycle...', false);
+        try {
+          await postForm('/api/run/once', {});
+          await Promise.all([fetchOverview(), refreshCollections()]);
+          setStatus('run cycle complete', false);
+        } catch (err) {
+          setStatus(err.message || String(err), true);
+        } finally {
+          els.runBtn.disabled = false;
+        }
+      }
+
+      async function addMagnet() {
+        const magnet = (els.magnetInput.value || '').trim();
+        if (!magnet) {
+          setStatus('magnet is required', true);
+          return;
+        }
+        setStatus('adding magnet...', false);
+        try {
+          await postForm('/api/torrents/add', { magnet: magnet });
+          els.magnetInput.value = '';
+          await refreshCollections();
+          setStatus('magnet added', false);
+        } catch (err) {
+          setStatus(err.message || String(err), true);
+        }
       }
 
       function startPolling() {
         els.live.textContent = 'polling';
         fetchOverview();
+        refreshCollections();
         setInterval(fetchOverview, 5000);
       }
 
@@ -469,12 +868,10 @@ const indexHTML = `<!doctype html>
           startPolling();
           return;
         }
-
         let retryMs = 1000;
         const connect = () => {
           const es = new EventSource('/api/stream');
           let closed = false;
-
           es.addEventListener('ready', function () {
             els.live.textContent = 'connected';
             retryMs = 1000;
@@ -486,6 +883,9 @@ const indexHTML = `<!doctype html>
           es.addEventListener('overview_error', function () {
             els.live.textContent = 'degraded (fallback)';
             fetchOverview();
+          });
+          ['magnet_added', 'conversion_queued', 'conversion_done', 'upload_done'].forEach(function (name) {
+            es.addEventListener(name, function () { refreshCollections(); });
           });
           es.onerror = function () {
             es.close();
@@ -502,6 +902,22 @@ const indexHTML = `<!doctype html>
         connect();
       }
 
+      if (els.addForm) {
+        els.addForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          addMagnet();
+        });
+      }
+      if (els.runBtn) {
+        els.runBtn.addEventListener('click', function () { runOnce(); });
+      }
+      if (els.refreshBtn) {
+        els.refreshBtn.addEventListener('click', function () { Promise.all([fetchOverview(), refreshCollections()]); });
+      }
+
+      fetchOverview();
+      refreshCollections();
+      setInterval(refreshCollections, 5000);
       startSSE();
     })();
   </script>

@@ -27,6 +27,11 @@ curl -s http://127.0.0.1:7777/metrics
 maxwell --config ./config.yaml vpn status
 ```
 
+### Auto-configure qBittorrent WebUI
+```bash
+maxwell --config ./config.yaml torrents setup-qbittorrent
+```
+
 ## Recovery
 
 ### Restart-safe queues

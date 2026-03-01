@@ -54,6 +54,15 @@ func (c *QBitClient) ensureLogin(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 
+	// When password is unset, rely on qBittorrent localhost bypass mode
+	// instead of repeated login attempts that can trigger temporary bans.
+	if strings.TrimSpace(c.password) == "" {
+		c.mu.Lock()
+		c.loggedIn = true
+		c.mu.Unlock()
+		return nil
+	}
+
 	form := url.Values{}
 	form.Set("username", c.username)
 	form.Set("password", c.password)
@@ -66,7 +75,7 @@ func (c *QBitClient) ensureLogin(ctx context.Context) error {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("qbittorrent %s request to %s failed: %w", req.Method, c.baseURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -91,7 +100,7 @@ func (c *QBitClient) List(ctx context.Context) ([]model.Torrent, error) {
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("qbittorrent %s request to %s failed: %w", req.Method, c.baseURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -155,7 +164,7 @@ func (c *QBitClient) AddMagnet(ctx context.Context, magnet string, downloadDir s
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("qbittorrent %s request to %s failed: %w", req.Method, c.baseURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -175,7 +184,7 @@ func (c *QBitClient) PauseAll(ctx context.Context) error {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("qbittorrent %s request to %s failed: %w", req.Method, c.baseURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -195,7 +204,7 @@ func (c *QBitClient) ResumeAll(ctx context.Context) error {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("qbittorrent %s request to %s failed: %w", req.Method, c.baseURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -228,7 +237,7 @@ func (c *QBitClient) pauseResumeHashes(ctx context.Context, endpoint string, has
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("qbittorrent %s request to %s failed: %w", req.Method, c.baseURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

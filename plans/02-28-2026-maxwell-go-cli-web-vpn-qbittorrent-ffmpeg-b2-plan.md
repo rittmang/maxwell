@@ -26,6 +26,7 @@ Build a production-grade local orchestration service in Go that provides:
 ### 1) Show active torrent downloads
 - Display active torrents in both CLI and web UI.
 - Include name, progress, speed, ETA, state, save path.
+- CLI and web must remain functionally equivalent for operator actions (parity matrix enforced by tests).
 
 ### 2) Add new magnet link via selected torrent integration
 - Submit magnet links through active torrent provider API.
@@ -204,16 +205,19 @@ Implementation details:
 
 Exit criteria:
 - Full workflow operable from CLI.
+- CLI parity tests verify equivalent behavior with web action surface.
 
 ### Step 9: Localhost web dashboard
 Implementation details:
 - Bind `127.0.0.1:<port>`.
 - Overview + torrents + queue + links + events views.
+- Web actions include magnet add and run-cycle controls equivalent to CLI capabilities.
 - Real-time updates over SSE.
 - State-changing endpoints require auth token + CSRF token.
 
 Exit criteria:
 - Full browser workflow without refresh-dependent status.
+- Web/CLI parity integration tests pass for shared actions.
 
 ### Step 10: Safety hardening
 Implementation details:
