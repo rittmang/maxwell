@@ -1,0 +1,54 @@
+vpn:
+  mode: enforce
+  check_interval_seconds: 8
+  allowed_tunnel_if_prefixes: [utun, tun, wg, ppp]
+  public_ip_check_urls:
+    - https://api.ipify.org?format=json
+    - https://ipinfo.io/json
+  allowed_vpn_asns: []
+  home_ssids: []
+  home_cidrs: []
+  home_public_ips: []
+  home_asns: []
+  require_safe_for_magnet_adds: true
+
+state_store:
+  driver: sqlite
+  dsn: ./maxwell.db
+  max_open_conns: 1
+
+torrent:
+  provider: qbittorrent
+  base_url: http://127.0.0.1:8080
+  username: ""
+  password: ""
+  download_dir: ./downloads
+  category: maxwell
+
+storage:
+  provider: backblaze_b2
+  endpoint: http://127.0.0.1:9000
+  bucket: media
+  key_id: ""
+  app_key: ""
+  public_base_url: https://cdn.example.com
+
+ffmpeg:
+  bin: copy
+  ffprobe_bin: ffprobe
+  preset: h264_1080p_fast
+
+paths:
+  downloads_dir: ./downloads
+  processed_dir: ./processed
+
+workers:
+  conversion: 1
+  upload: 1
+  max_attempts: 5
+  backoff_seconds: 5
+
+security:
+  web_bind: 127.0.0.1:7777
+  web_token: ""
+  csrf_enabled: true

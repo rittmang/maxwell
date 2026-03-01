@@ -1,0 +1,41 @@
+# Go build artifacts
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.cover
+coverage.*
+
+# Local binaries/artifacts
+/maxwell
+
+# Dependency/vendor (if used locally)
+/vendor/
+
+# Local runtime/state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+*.tmp
+/downloads/
+/processed/
+
+# Local config/secrets
+.env
+.env.*
+/config.yaml
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
