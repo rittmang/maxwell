@@ -26,9 +26,11 @@ func (f fakeGate) Status(context.Context) (model.VPNState, vpn.Signals, error) {
 }
 
 type fakeTorrent struct {
-	list       []model.Torrent
-	added      []string
-	pauseCalls int
+	list          []model.Torrent
+	added         []string
+	pauseCalls    int
+	pausedHashes  [][]string
+	resumedHashes [][]string
 }
 
 func (f *fakeTorrent) Name() string { return "fake" }
@@ -43,9 +45,15 @@ func (f *fakeTorrent) PauseAll(context.Context) error {
 	f.pauseCalls++
 	return nil
 }
-func (f *fakeTorrent) ResumeAll(context.Context) error              { return nil }
-func (f *fakeTorrent) PauseHashes(context.Context, []string) error  { return nil }
-func (f *fakeTorrent) ResumeHashes(context.Context, []string) error { return nil }
+func (f *fakeTorrent) ResumeAll(context.Context) error { return nil }
+func (f *fakeTorrent) PauseHashes(_ context.Context, hashes []string) error {
+	f.pausedHashes = append(f.pausedHashes, append([]string(nil), hashes...))
+	return nil
+}
+func (f *fakeTorrent) ResumeHashes(_ context.Context, hashes []string) error {
+	f.resumedHashes = append(f.resumedHashes, append([]string(nil), hashes...))
+	return nil
+}
 
 type fakeUploader struct {
 	urls map[string]string
@@ -238,5 +246,90 @@ func TestConversionRetryAndRecovery(t *testing.T) {
 	}
 	if len(links) != 1 {
 		t.Fatalf("expected successful retry to produce link")
+	}
+}
+
+func TestPauseResumeItemControls(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Paths.ProcessedDir = filepath.Join(dir, "processed")
+	cfg.StateStore.DSN = filepath.Join(dir, "maxwell.db")
+	cfg.Workers.MaxAttempts = 3
+	_ = os.MkdirAll(cfg.Paths.ProcessedDir, 0o755)
+
+	ft := &fakeTorrent{}
+	svc := newService(t, fakeGate{state: model.VPNStateSafe}, ft, fakeUploader{urls: map[string]string{}}, cfg)
+	defer svc.Close()
+	ctx := context.Background()
+
+	if err := svc.PauseTorrent(ctx, "hash-1"); err != nil {
+		t.Fatalf("pause torrent: %v", err)
+	}
+	if len(ft.pausedHashes) != 1 || len(ft.pausedHashes[0]) != 1 || ft.pausedHashes[0][0] != "hash-1" {
+		t.Fatalf("unexpected paused hashes: %+v", ft.pausedHashes)
+	}
+	if err := svc.ResumeTorrent(ctx, "hash-1"); err != nil {
+		t.Fatalf("resume torrent: %v", err)
+	}
+	if len(ft.resumedHashes) != 1 || len(ft.resumedHashes[0]) != 1 || ft.resumedHashes[0][0] != "hash-1" {
+		t.Fatalf("unexpected resumed hashes: %+v", ft.resumedHashes)
+	}
+
+	inserted, err := svc.store.EnqueueConversion(ctx, "hash-1", "/in/a.mkv", "/out/a.mp4", "h264")
+	if err != nil || !inserted {
+		t.Fatalf("enqueue conversion: inserted=%v err=%v", inserted, err)
+	}
+	convJobs, err := svc.ListConversionJobs(ctx)
+	if err != nil || len(convJobs) != 1 {
+		t.Fatalf("list conversion jobs: len=%d err=%v", len(convJobs), err)
+	}
+	if err := svc.PauseConversionJob(ctx, convJobs[0].ID); err != nil {
+		t.Fatalf("pause conversion: %v", err)
+	}
+	convJobs, err = svc.ListConversionJobs(ctx)
+	if err != nil {
+		t.Fatalf("list conversion jobs after pause: %v", err)
+	}
+	if convJobs[0].Status != model.JobStatusPaused {
+		t.Fatalf("expected paused conversion status, got %s", convJobs[0].Status)
+	}
+	if err := svc.ResumeConversionJob(ctx, convJobs[0].ID); err != nil {
+		t.Fatalf("resume conversion: %v", err)
+	}
+	convJobs, err = svc.ListConversionJobs(ctx)
+	if err != nil {
+		t.Fatalf("list conversion jobs after resume: %v", err)
+	}
+	if convJobs[0].Status != model.JobStatusQueued {
+		t.Fatalf("expected queued conversion status, got %s", convJobs[0].Status)
+	}
+
+	inserted, err = svc.store.EnqueueUpload(ctx, "/tmp/a.mp4", "2026/03/01/a.mp4")
+	if err != nil || !inserted {
+		t.Fatalf("enqueue upload: inserted=%v err=%v", inserted, err)
+	}
+	uploadJobs, err := svc.ListUploadJobs(ctx)
+	if err != nil || len(uploadJobs) != 1 {
+		t.Fatalf("list upload jobs: len=%d err=%v", len(uploadJobs), err)
+	}
+	if err := svc.PauseUploadJob(ctx, uploadJobs[0].ID); err != nil {
+		t.Fatalf("pause upload: %v", err)
+	}
+	uploadJobs, err = svc.ListUploadJobs(ctx)
+	if err != nil {
+		t.Fatalf("list upload jobs after pause: %v", err)
+	}
+	if uploadJobs[0].Status != model.JobStatusPaused {
+		t.Fatalf("expected paused upload status, got %s", uploadJobs[0].Status)
+	}
+	if err := svc.ResumeUploadJob(ctx, uploadJobs[0].ID); err != nil {
+		t.Fatalf("resume upload: %v", err)
+	}
+	uploadJobs, err = svc.ListUploadJobs(ctx)
+	if err != nil {
+		t.Fatalf("list upload jobs after resume: %v", err)
+	}
+	if uploadJobs[0].Status != model.JobStatusQueued {
+		t.Fatalf("expected queued upload status, got %s", uploadJobs[0].Status)
 	}
 }

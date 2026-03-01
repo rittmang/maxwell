@@ -28,6 +28,19 @@ Build a production-grade local orchestration service in Go that provides:
 - Include name, progress, speed, ETA, state, save path.
 - CLI and web must remain functionally equivalent for operator actions (parity matrix enforced by tests).
 
+### 1.1) Per-item control surface (web context menu)
+- Right-click on individual rows in:
+- active torrents.
+- conversion queue.
+- upload queue.
+- Context menu actions:
+- `Pause`.
+- `Continue` (resume).
+- Action semantics:
+- torrent rows map to provider pause/resume by hash.
+- conversion/upload rows map to queue `paused <-> queued` transitions.
+- UI must expose actionable status feedback and refresh table state without requiring manual page reload.
+
 ### 2) Add new magnet link via selected torrent integration
 - Submit magnet links through active torrent provider API.
 - Force downloads to preconfigured directory.
@@ -48,6 +61,12 @@ Build a production-grade local orchestration service in Go that provides:
 - `sqlite` for local default.
 - `postgres` / `mysql` as first-class alternatives.
 - SQL behavior must remain idempotent and restart-safe across drivers.
+
+### 6) Pipeline board UX and automatic progression
+- Web UI must present `Active Torrents -> Conversion Queue -> Upload Queue -> Links` as a left-to-right Kanban board.
+- Items are not draggable by users; lane transitions are system-driven only.
+- When web mode is running, backend pipeline processing continues automatically without requiring manual `Run One Cycle` clicks.
+- Cards/rows should refresh automatically so users can observe stage transitions live.
 
 ## 2026 Engineering Standards
 - Go toolchain pinned with `go.mod` `toolchain` directive and reproducible builds.
@@ -211,13 +230,31 @@ Exit criteria:
 Implementation details:
 - Bind `127.0.0.1:<port>`.
 - Overview + torrents + queue + links + events views.
+- Pipeline board view (left-to-right lanes): `Active Torrents`, `Conversion Queue`, `Upload Queue`, `Links`.
 - Web actions include magnet add and run-cycle controls equivalent to CLI capabilities.
+- Add row-level context menu actions for torrent/conversion/upload entries (`pause`, `continue`).
+- Add CSRF-protected action endpoints:
+- `/api/torrents/action`.
+- `/api/conversion/action`.
+- `/api/upload/action`.
 - Real-time updates over SSE.
 - State-changing endpoints require auth token + CSRF token.
 
 Exit criteria:
 - Full browser workflow without refresh-dependent status.
+- Right-click actions mutate backend state and reflect in tables immediately.
+- Cards visibly move between Kanban lanes as pipeline stages complete.
 - Web/CLI parity integration tests pass for shared actions.
+
+### Step 9.1: Web-mode background pipeline worker
+Implementation details:
+- Start a background loop in `web` command lifecycle to call:
+- `SyncCompletedDownloads`.
+- `ProcessOnce`.
+- Ensure graceful shutdown with command context cancellation.
+
+Exit criteria:
+- Running `maxwell web` alone advances download->conversion->upload->links state over time.
 
 ### Step 10: Safety hardening
 Implementation details:

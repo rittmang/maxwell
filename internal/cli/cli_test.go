@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"maxwell/internal/config"
 	"maxwell/internal/events"
@@ -34,6 +36,8 @@ func (f *fakeCLIService) AddMagnet(_ context.Context, magnet string) (string, er
 	f.added = magnet
 	return "id-1", nil
 }
+func (f *fakeCLIService) PauseTorrent(context.Context, string) error  { return nil }
+func (f *fakeCLIService) ResumeTorrent(context.Context, string) error { return nil }
 func (f *fakeCLIService) SyncCompletedDownloads(context.Context) error {
 	f.syncCalls++
 	return nil
@@ -48,6 +52,10 @@ func (f *fakeCLIService) ListConversionJobs(context.Context) ([]model.Conversion
 func (f *fakeCLIService) ListUploadJobs(context.Context) ([]model.UploadJob, error) {
 	return []model.UploadJob{{ID: 2}}, nil
 }
+func (f *fakeCLIService) PauseConversionJob(context.Context, int64) error  { return nil }
+func (f *fakeCLIService) ResumeConversionJob(context.Context, int64) error { return nil }
+func (f *fakeCLIService) PauseUploadJob(context.Context, int64) error      { return nil }
+func (f *fakeCLIService) ResumeUploadJob(context.Context, int64) error     { return nil }
 func (f *fakeCLIService) ListLinks(context.Context, int) ([]model.LinkRecord, error) {
 	return []model.LinkRecord{{ID: 1, FinalURL: "https://example.com"}}, nil
 }
@@ -251,5 +259,21 @@ state_store:
 	}
 	if cfg.Torrent.BaseURL != "http://127.0.0.1:8090" {
 		t.Fatalf("unexpected base_url: %s", cfg.Torrent.BaseURL)
+	}
+}
+
+func TestStartWebPipelineLoop(t *testing.T) {
+	svc := &fakeCLIService{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startWebPipelineLoop(ctx, svc, 20*time.Millisecond, io.Discard)
+	time.Sleep(90 * time.Millisecond)
+	cancel()
+	<-done
+
+	if svc.syncCalls < 2 {
+		t.Fatalf("expected periodic sync calls, got %d", svc.syncCalls)
+	}
+	if svc.processCalls < 2 {
+		t.Fatalf("expected periodic process calls, got %d", svc.processCalls)
 	}
 }

@@ -459,6 +459,37 @@ func (s *Store) MarkConversionFailed(ctx context.Context, id int64, errMessage s
 	return err
 }
 
+func (s *Store) PauseConversionJob(ctx context.Context, id int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		s.q(`UPDATE conversion_jobs SET status=?, updated_at=? WHERE id=? AND status=?`),
+		string(model.JobStatusPaused), time.Now().UTC(), id, string(model.JobStatusQueued),
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (s *Store) ResumeConversionJob(ctx context.Context, id int64) (bool, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		s.q(`UPDATE conversion_jobs SET status=?, error=?, next_attempt_at=?, updated_at=? WHERE id=? AND status=?`),
+		string(model.JobStatusQueued), "", now, now, id, string(model.JobStatusPaused),
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 func (s *Store) EnqueueUpload(ctx context.Context, filePath, objectKey string) (bool, error) {
 	res, err := s.insertIgnoreUpload(ctx, filePath, objectKey)
 	if err != nil {
@@ -592,6 +623,37 @@ func (s *Store) MarkUploadFailed(ctx context.Context, id int64, errMessage strin
 		status, errMessage, retryAt.UTC(), time.Now().UTC(), id,
 	)
 	return err
+}
+
+func (s *Store) PauseUploadJob(ctx context.Context, id int64) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		s.q(`UPDATE upload_jobs SET status=?, updated_at=? WHERE id=? AND status=?`),
+		string(model.JobStatusPaused), time.Now().UTC(), id, string(model.JobStatusQueued),
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (s *Store) ResumeUploadJob(ctx context.Context, id int64) (bool, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		s.q(`UPDATE upload_jobs SET status=?, error=?, next_attempt_at=?, updated_at=? WHERE id=? AND status=?`),
+		string(model.JobStatusQueued), "", now, now, id, string(model.JobStatusPaused),
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func (s *Store) ListLinks(ctx context.Context, limit int) ([]model.LinkRecord, error) {

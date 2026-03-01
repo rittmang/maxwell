@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,10 +27,16 @@ type Service interface {
 	Stats(context.Context) (map[string]int64, error)
 	ListTorrents(context.Context) ([]model.Torrent, error)
 	AddMagnet(context.Context, string) (string, error)
+	PauseTorrent(context.Context, string) error
+	ResumeTorrent(context.Context, string) error
 	SyncCompletedDownloads(context.Context) error
 	ProcessOnce(context.Context) error
 	ListConversionJobs(context.Context) ([]model.ConversionJob, error)
 	ListUploadJobs(context.Context) ([]model.UploadJob, error)
+	PauseConversionJob(context.Context, int64) error
+	ResumeConversionJob(context.Context, int64) error
+	PauseUploadJob(context.Context, int64) error
+	ResumeUploadJob(context.Context, int64) error
 	ListLinks(context.Context, int) ([]model.LinkRecord, error)
 	ListEvents(context.Context, int) ([]model.Event, error)
 	EventBus() *events.Bus
@@ -63,8 +70,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/overview", s.handleOverview)
 	s.mux.HandleFunc("/api/torrents", s.handleTorrents)
 	s.mux.HandleFunc("/api/torrents/add", s.handleAddTorrent)
+	s.mux.HandleFunc("/api/torrents/action", s.handleTorrentAction)
 	s.mux.HandleFunc("/api/run/once", s.handleRunOnce)
 	s.mux.HandleFunc("/api/queue", s.handleQueue)
+	s.mux.HandleFunc("/api/conversion/action", s.handleConversionAction)
+	s.mux.HandleFunc("/api/upload/action", s.handleUploadAction)
 	s.mux.HandleFunc("/api/links", s.handleLinks)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
 	s.mux.HandleFunc("/api/stream", s.handleStream)
@@ -141,6 +151,115 @@ func (s *Server) handleAddTorrent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"id": id})
 }
 
+func (s *Server) handleTorrentAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizeMutation(w, r) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	hash := strings.TrimSpace(r.Form.Get("hash"))
+	action := strings.ToLower(strings.TrimSpace(r.Form.Get("action")))
+	if hash == "" {
+		http.Error(w, "hash is required", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	var err error
+	switch action {
+	case "pause":
+		err = s.svc.PauseTorrent(ctx, hash)
+	case "resume":
+		err = s.svc.ResumeTorrent(ctx, hash)
+	default:
+		http.Error(w, "invalid action", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleConversionAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizeMutation(w, r) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	id, err := parseIDFormField(r.Form.Get("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(r.Form.Get("action")))
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	switch action {
+	case "pause":
+		err = s.svc.PauseConversionJob(ctx, id)
+	case "resume":
+		err = s.svc.ResumeConversionJob(ctx, id)
+	default:
+		http.Error(w, "invalid action", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleUploadAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.authorizeMutation(w, r) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	id, err := parseIDFormField(r.Form.Get("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(r.Form.Get("action")))
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	switch action {
+	case "pause":
+		err = s.svc.PauseUploadJob(ctx, id)
+	case "resume":
+		err = s.svc.ResumeUploadJob(ctx, id)
+	default:
+		http.Error(w, "invalid action", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 func (s *Server) handleRunOnce(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -160,6 +279,18 @@ func (s *Server) handleRunOnce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+func parseIDFormField(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, fmt.Errorf("id is required")
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid id")
+	}
+	return id, nil
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
@@ -444,11 +575,7 @@ const indexHTML = `<!doctype html>
     .panels {
       margin-top: 14px;
       display: grid;
-      grid-template-columns: repeat(auto-fit,minmax(420px,1fr));
       gap: 10px;
-    }
-    .panel-wide {
-      grid-column: 1 / -1;
     }
     .panel h3 {
       margin: 0 0 10px;
@@ -468,44 +595,156 @@ const indexHTML = `<!doctype html>
       font-family: inherit;
       font-size: 14px;
     }
-    .table-wrap {
-      overflow: auto;
-      max-height: 280px;
+    .board {
+      overflow-x: auto;
+      padding-bottom: 6px;
+    }
+    .board-track {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(260px, 1fr));
+      gap: 12px;
+      min-width: 1080px;
+    }
+    .lane {
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 12px;
+      padding: 10px;
+      background: linear-gradient(180deg, #f9fcfa 0%, #f4f8f5 100%);
+      min-height: 320px;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 10px;
     }
-    table {
-      width: 100%;
-      border-collapse: collapse;
+    .lane-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
       font-size: 13px;
-      min-width: 680px;
+      font-weight: 700;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+      color: #2b4135;
     }
-    table.torrent-table {
-      min-width: 980px;
-      table-layout: fixed;
+    .lane-count {
+      min-width: 24px;
+      text-align: center;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #e5efe9;
+      border: 1px solid #d2e2d9;
+      font-size: 12px;
     }
-    table.torrent-table th:nth-child(1), table.torrent-table td:nth-child(1) { width: 260px; }
-    table.torrent-table th:nth-child(2), table.torrent-table td:nth-child(2) { width: 80px; }
-    table.torrent-table th:nth-child(3), table.torrent-table td:nth-child(3) { width: 90px; }
-    table.torrent-table th:nth-child(4), table.torrent-table td:nth-child(4) { width: 90px; }
-    table.torrent-table th:nth-child(5), table.torrent-table td:nth-child(5) { width: 120px; }
-    table.torrent-table th:nth-child(6), table.torrent-table td:nth-child(6) { width: 340px; }
-    th, td {
-      border-bottom: 1px solid var(--border);
-      padding: 8px;
-      text-align: left;
+    .lane-list {
+      display: grid;
+      align-content: start;
+      gap: 8px;
+      min-height: 44px;
+    }
+    .empty-lane {
+      border: 1px dashed #c8d9ce;
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,.6);
+    }
+    .item-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px;
+      background: #ffffff;
+      box-shadow: 0 3px 10px rgba(26,43,31,.08);
+      display: grid;
+      gap: 6px;
+    }
+    .item-card[data-row-kind] { cursor: context-menu; }
+    .item-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .item-title {
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .item-badge {
+      border-radius: 999px;
+      border: 1px solid #d1e2d8;
+      background: #eff7f2;
+      color: #2d4f3c;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 700;
       white-space: nowrap;
     }
-    th { background: #f0f6f2; position: sticky; top: 0; }
-    td.wrap { white-space: normal; word-break: break-word; }
-    .empty { color: var(--muted); padding: 10px; font-size: 13px; }
-    table.torrent-table td.wrap {
-      word-break: normal;
-      overflow-wrap: anywhere;
+    .item-meta {
+      display: grid;
+      gap: 3px;
+      font-size: 12px;
+      color: #334c3e;
+    }
+    .item-meta-line {
+      display: grid;
+      grid-template-columns: 70px 1fr;
+      gap: 6px;
+      align-items: baseline;
+    }
+    .item-meta-label {
+      color: #617464;
+      text-transform: uppercase;
+      font-size: 10px;
+      letter-spacing: .03em;
+      font-weight: 700;
+    }
+    .item-meta-value {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .events-list {
+      display: grid;
+      gap: 8px;
+      max-height: 300px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .context-menu {
+      position: fixed;
+      z-index: 999;
+      min-width: 150px;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 12px 28px rgba(26,43,31,.2);
+      padding: 6px;
+      display: grid;
+      gap: 4px;
+    }
+    .context-menu[hidden] { display: none; }
+    .context-menu button {
+      text-align: left;
+      background: #ffffff;
+      color: var(--ink);
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-weight: 600;
+    }
+    .context-menu button:hover:not(:disabled) {
+      background: #eef5f0;
+      border-color: var(--border);
+    }
+    .context-menu button:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+      background: #f7faf8;
     }
     @media (max-width: 980px) {
-      .panels { grid-template-columns: 1fr; }
-      .panel-wide { grid-column: auto; }
+      .board-track { min-width: 100%; grid-template-columns: 1fr; }
     }
     @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
   </style>
@@ -554,66 +793,39 @@ const indexHTML = `<!doctype html>
         </form>
       </div>
 
-      <div class="panel panel-wide">
-        <h3>Active Torrents</h3>
-        <div class="table-wrap">
-          <table class="torrent-table">
-            <thead>
-              <tr><th>Name</th><th>Progress</th><th>Speed</th><th>ETA</th><th>State</th><th>Path</th></tr>
-            </thead>
-            <tbody id="torrents-body"></tbody>
-          </table>
-        </div>
-      </div>
-
       <div class="panel">
-        <h3>Conversion Queue</h3>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th>ID</th><th>Status</th><th>Attempts</th><th>Input</th><th>Output</th></tr>
-            </thead>
-            <tbody id="conv-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h3>Upload Queue</h3>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th>ID</th><th>Status</th><th>Attempts</th><th>Key</th><th>Final URL</th></tr>
-            </thead>
-            <tbody id="upload-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h3>Links</h3>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th>ID</th><th>File</th><th>URL</th><th>Created</th></tr>
-            </thead>
-            <tbody id="links-body"></tbody>
-          </table>
+        <h3>Pipeline Board</h3>
+        <div class="board">
+          <div class="board-track" id="pipeline-board">
+            <section class="lane" id="lane-torrents">
+              <div class="lane-head">Active Torrents <span class="lane-count" id="torrents-count">0</span></div>
+              <div class="lane-list" id="torrents-lane"></div>
+            </section>
+            <section class="lane" id="lane-conversion">
+              <div class="lane-head">Conversion Queue <span class="lane-count" id="conversion-count">0</span></div>
+              <div class="lane-list" id="conv-lane"></div>
+            </section>
+            <section class="lane" id="lane-upload">
+              <div class="lane-head">Upload Queue <span class="lane-count" id="upload-count">0</span></div>
+              <div class="lane-list" id="upload-lane"></div>
+            </section>
+            <section class="lane" id="lane-links">
+              <div class="lane-head">Links <span class="lane-count" id="links-count">0</span></div>
+              <div class="lane-list" id="links-lane"></div>
+            </section>
+          </div>
         </div>
       </div>
 
       <div class="panel">
         <h3>Events</h3>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th>ID</th><th>Level</th><th>Type</th><th>Message</th><th>At</th></tr>
-            </thead>
-            <tbody id="events-body"></tbody>
-          </table>
-        </div>
+        <div class="events-list" id="events-list"></div>
       </div>
     </div>
+  </div>
+  <div id="row-context-menu" class="context-menu" hidden>
+    <button type="button" data-action="pause">Pause</button>
+    <button type="button" data-action="resume">Continue</button>
   </div>
   <script>
     (function () {
@@ -633,12 +845,19 @@ const indexHTML = `<!doctype html>
         magnetInput: document.getElementById('magnet-input'),
         runBtn: document.getElementById('run-once-btn'),
         refreshBtn: document.getElementById('refresh-btn'),
-        torrentsBody: document.getElementById('torrents-body'),
-        convBody: document.getElementById('conv-body'),
-        uploadBody: document.getElementById('upload-body'),
-        linksBody: document.getElementById('links-body'),
-        eventsBody: document.getElementById('events-body')
+        rowMenu: document.getElementById('row-context-menu'),
+        torrentsLane: document.getElementById('torrents-lane'),
+        convLane: document.getElementById('conv-lane'),
+        uploadLane: document.getElementById('upload-lane'),
+        linksLane: document.getElementById('links-lane'),
+        eventsList: document.getElementById('events-list'),
+        torrentsCount: document.getElementById('torrents-count'),
+        conversionCount: document.getElementById('conversion-count'),
+        uploadCount: document.getElementById('upload-count'),
+        linksCount: document.getElementById('links-count')
       };
+
+      let rowActionContext = null;
 
       function setText(el, value) {
         if (el) el.textContent = String(value ?? 0);
@@ -701,78 +920,221 @@ const indexHTML = `<!doctype html>
         }
       }
 
-      function renderRows(target, rows, emptyMsg) {
+      function renderLane(target, items, emptyMsg) {
         if (!target) return;
-        if (!rows || rows.length === 0) {
-          target.innerHTML = '<tr><td class="empty" colspan="8">' + escapeHtml(emptyMsg) + '</td></tr>';
+        if (!items || items.length === 0) {
+          target.innerHTML = '<div class="empty-lane">' + escapeHtml(emptyMsg) + '</div>';
           return;
         }
-        target.innerHTML = rows.join('');
+        target.innerHTML = items.join('');
+      }
+
+      function laneMetaLine(label, value) {
+        const l = escapeHtml(label);
+        const v = escapeHtml(value == null ? '' : value);
+        return '<div class="item-meta-line"><span class="item-meta-label">' + l + '</span><span class="item-meta-value" title="' + v + '">' + v + '</span></div>';
+      }
+
+      function itemCard(kind, id, status, title, badge, metaLines) {
+        const titleHTML = escapeHtml(title == null ? '' : title);
+        const badgeHTML = escapeHtml(badge == null ? '' : badge);
+        const attrs = kind && id
+          ? ' data-row-kind="' + escapeHtml(kind) + '" data-row-id="' + escapeHtml(id) + '" data-row-status="' + escapeHtml(status || '') + '"'
+          : '';
+        return '<article class="item-card"' + attrs + '>' +
+          '<div class="item-head">' +
+            '<div class="item-title" title="' + titleHTML + '">' + titleHTML + '</div>' +
+            '<span class="item-badge">' + badgeHTML + '</span>' +
+          '</div>' +
+          '<div class="item-meta">' + metaLines.join('') + '</div>' +
+        '</article>';
+      }
+
+      function normalizeStatus(v) {
+        return String(v == null ? '' : v).trim().toLowerCase();
+      }
+
+      function isTorrentPausedState(status) {
+        const s = normalizeStatus(status);
+        return s.indexOf('pause') >= 0 || s.indexOf('stopped') >= 0;
+      }
+
+      function canPauseRow(ctx) {
+        if (!ctx) return false;
+        if (ctx.kind === 'torrent') return !isTorrentPausedState(ctx.status);
+        return ctx.status === 'queued';
+      }
+
+      function canResumeRow(ctx) {
+        if (!ctx) return false;
+        if (ctx.kind === 'torrent') return isTorrentPausedState(ctx.status);
+        return ctx.status === 'paused';
+      }
+
+      function hideContextMenu() {
+        if (!els.rowMenu) return;
+        els.rowMenu.hidden = true;
+        rowActionContext = null;
+      }
+
+      function showContextMenu(x, y, ctx) {
+        if (!els.rowMenu) return;
+        rowActionContext = ctx;
+        const pauseBtn = els.rowMenu.querySelector('button[data-action="pause"]');
+        const resumeBtn = els.rowMenu.querySelector('button[data-action="resume"]');
+        if (pauseBtn) pauseBtn.disabled = !canPauseRow(ctx);
+        if (resumeBtn) resumeBtn.disabled = !canResumeRow(ctx);
+        els.rowMenu.hidden = false;
+        const rect = els.rowMenu.getBoundingClientRect();
+        let left = x;
+        let top = y;
+        if (left + rect.width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - rect.width - 8);
+        if (top + rect.height > window.innerHeight - 8) top = Math.max(8, window.innerHeight - rect.height - 8);
+        els.rowMenu.style.left = String(left) + 'px';
+        els.rowMenu.style.top = String(top) + 'px';
+      }
+
+      function rowContextFromTarget(target) {
+        const row = target && target.closest ? target.closest('[data-row-kind][data-row-id]') : null;
+        if (!row) return null;
+        const kind = String(row.dataset.rowKind || '').trim();
+        const id = String(row.dataset.rowId || '').trim();
+        const status = normalizeStatus(row.dataset.rowStatus || '');
+        if (!kind || !id) return null;
+        return { kind: kind, id: id, status: status };
+      }
+
+      function actionRequestForRow(ctx, action) {
+        if (!ctx) return null;
+        if (ctx.kind === 'torrent') {
+          return { url: '/api/torrents/action', body: { hash: ctx.id, action: action } };
+        }
+        if (ctx.kind === 'conversion') {
+          return { url: '/api/conversion/action', body: { id: ctx.id, action: action } };
+        }
+        if (ctx.kind === 'upload') {
+          return { url: '/api/upload/action', body: { id: ctx.id, action: action } };
+        }
+        return null;
+      }
+
+      async function runRowAction(action, ctx) {
+        const req = actionRequestForRow(ctx, action);
+        if (!req) return;
+        const stateWord = action === 'pause' ? 'paused' : 'continued';
+        setStatus(ctx.kind + ' ' + stateWord + '...', false);
+        try {
+          await postForm(req.url, req.body);
+          await refreshCollections();
+          setStatus(ctx.kind + ' ' + stateWord, false);
+        } catch (err) {
+          setStatus(err.message || String(err), true);
+        }
       }
 
       function renderTorrents(items) {
-        const rows = (items || []).map(function (t) {
-          return '<tr>' +
-            '<td class="wrap">' + escapeHtml(t.name) + '</td>' +
-            '<td>' + escapeHtml(fmtNum((t.progress || 0) * 100)) + '%</td>' +
-            '<td>' + escapeHtml(t.download_speed) + '</td>' +
-            '<td>' + escapeHtml(t.eta_seconds) + '</td>' +
-            '<td>' + escapeHtml(t.state) + '</td>' +
-            '<td class="wrap">' + escapeHtml(t.save_path) + '</td>' +
-          '</tr>';
+        const list = items || [];
+        setText(els.torrentsCount, list.length);
+        const cards = list.map(function (t) {
+          const id = String(t.id || '');
+          const state = String(t.state || '');
+          const pct = fmtNum((t.progress || 0) * 100) + '%';
+          return itemCard(
+            'torrent',
+            id,
+            normalizeStatus(state),
+            t.name || id,
+            pct,
+            [
+              laneMetaLine('State', state || '-'),
+              laneMetaLine('Speed', t.download_speed),
+              laneMetaLine('ETA', t.eta_seconds),
+              laneMetaLine('Path', t.save_path || '-')
+            ]
+          );
         });
-        renderRows(els.torrentsBody, rows, 'No active torrents');
+        renderLane(els.torrentsLane, cards, 'No active torrents');
       }
 
       function renderConversion(items) {
-        const rows = (items || []).map(function (j) {
-          return '<tr>' +
-            '<td>' + escapeHtml(j.id) + '</td>' +
-            '<td>' + escapeHtml(j.status) + '</td>' +
-            '<td>' + escapeHtml(j.attempts) + '</td>' +
-            '<td class="wrap">' + escapeHtml(j.input_path) + '</td>' +
-            '<td class="wrap">' + escapeHtml(j.output_path) + '</td>' +
-          '</tr>';
+        const list = items || [];
+        setText(els.conversionCount, list.length);
+        const cards = list.map(function (j) {
+          const id = String(j.id || '');
+          const status = normalizeStatus(j.status);
+          return itemCard(
+            'conversion',
+            id,
+            status,
+            'Job #' + id,
+            j.status || '-',
+            [
+              laneMetaLine('Attempts', j.attempts),
+              laneMetaLine('Input', j.input_path || '-'),
+              laneMetaLine('Output', j.output_path || '-')
+            ]
+          );
         });
-        renderRows(els.convBody, rows, 'No conversion jobs');
+        renderLane(els.convLane, cards, 'No conversion jobs');
       }
 
       function renderUpload(items) {
-        const rows = (items || []).map(function (j) {
-          return '<tr>' +
-            '<td>' + escapeHtml(j.id) + '</td>' +
-            '<td>' + escapeHtml(j.status) + '</td>' +
-            '<td>' + escapeHtml(j.attempts) + '</td>' +
-            '<td class="wrap">' + escapeHtml(j.object_key) + '</td>' +
-            '<td class="wrap">' + escapeHtml(j.final_url || '') + '</td>' +
-          '</tr>';
+        const list = items || [];
+        setText(els.uploadCount, list.length);
+        const cards = list.map(function (j) {
+          const id = String(j.id || '');
+          const status = normalizeStatus(j.status);
+          return itemCard(
+            'upload',
+            id,
+            status,
+            'Job #' + id,
+            j.status || '-',
+            [
+              laneMetaLine('Attempts', j.attempts),
+              laneMetaLine('Key', j.object_key || '-'),
+              laneMetaLine('URL', j.final_url || '-')
+            ]
+          );
         });
-        renderRows(els.uploadBody, rows, 'No upload jobs');
+        renderLane(els.uploadLane, cards, 'No upload jobs');
       }
 
       function renderLinks(items) {
-        const rows = (items || []).map(function (l) {
-          return '<tr>' +
-            '<td>' + escapeHtml(l.id) + '</td>' +
-            '<td class="wrap">' + escapeHtml(l.file_path) + '</td>' +
-            '<td class="wrap"><a href="' + escapeHtml(l.final_url) + '" target="_blank" rel="noreferrer">' + escapeHtml(l.final_url) + '</a></td>' +
-            '<td>' + escapeHtml(l.created_at) + '</td>' +
-          '</tr>';
+        const list = items || [];
+        setText(els.linksCount, list.length);
+        const cards = list.map(function (l) {
+          return itemCard(
+            '',
+            '',
+            '',
+            l.file_path || ('Link #' + (l.id == null ? '' : l.id)),
+            'Ready',
+            [
+              laneMetaLine('URL', l.final_url || '-'),
+              laneMetaLine('Created', l.created_at || '-')
+            ]
+          );
         });
-        renderRows(els.linksBody, rows, 'No links emitted');
+        renderLane(els.linksLane, cards, 'No links emitted');
       }
 
       function renderEvents(items) {
-        const rows = (items || []).map(function (e) {
-          return '<tr>' +
-            '<td>' + escapeHtml(e.id) + '</td>' +
-            '<td>' + escapeHtml(e.level) + '</td>' +
-            '<td>' + escapeHtml(e.type) + '</td>' +
-            '<td class="wrap">' + escapeHtml(e.message) + '</td>' +
-            '<td>' + escapeHtml(e.created_at) + '</td>' +
-          '</tr>';
+        const list = (items || []).slice(0, 80);
+        const cards = list.map(function (e) {
+          return itemCard(
+            '',
+            '',
+            '',
+            (e.type || 'event') + ' #' + escapeHtml(e.id),
+            e.level || 'info',
+            [
+              laneMetaLine('Message', e.message || '-'),
+              laneMetaLine('At', e.created_at || '-')
+            ]
+          );
         });
-        renderRows(els.eventsBody, rows, 'No events yet');
+        renderLane(els.eventsList, cards, 'No events yet');
       }
 
       async function fetchJSON(url) {
@@ -884,7 +1246,7 @@ const indexHTML = `<!doctype html>
             els.live.textContent = 'degraded (fallback)';
             fetchOverview();
           });
-          ['magnet_added', 'conversion_queued', 'conversion_done', 'upload_done'].forEach(function (name) {
+          ['magnet_added', 'conversion_queued', 'conversion_done', 'upload_done', 'torrent_paused', 'torrent_resumed', 'conversion_paused', 'conversion_resumed', 'upload_paused', 'upload_resumed'].forEach(function (name) {
             es.addEventListener(name, function () { refreshCollections(); });
           });
           es.onerror = function () {
@@ -913,6 +1275,35 @@ const indexHTML = `<!doctype html>
       }
       if (els.refreshBtn) {
         els.refreshBtn.addEventListener('click', function () { Promise.all([fetchOverview(), refreshCollections()]); });
+      }
+      if (els.rowMenu) {
+        document.addEventListener('contextmenu', function (e) {
+          const ctx = rowContextFromTarget(e.target);
+          if (!ctx) return;
+          e.preventDefault();
+          showContextMenu(e.clientX, e.clientY, ctx);
+        });
+        document.addEventListener('click', function (e) {
+          if (!els.rowMenu || els.rowMenu.hidden) return;
+          const btn = e.target.closest('#row-context-menu button[data-action]');
+          if (btn) {
+            e.preventDefault();
+            if (!btn.disabled) {
+              const action = String(btn.getAttribute('data-action') || '').trim();
+              const ctx = rowActionContext;
+              hideContextMenu();
+              if (action) runRowAction(action, ctx);
+            }
+            return;
+          }
+          if (!e.target.closest('#row-context-menu')) {
+            hideContextMenu();
+          }
+        });
+        document.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape') hideContextMenu();
+        });
+        window.addEventListener('scroll', function () { hideContextMenu(); }, { passive: true });
       }
 
       fetchOverview();

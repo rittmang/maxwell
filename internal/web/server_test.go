@@ -20,10 +20,16 @@ import (
 )
 
 type fakeService struct {
-	bus          *events.Bus
-	addedMagnet  string
-	syncCalls    int
-	processCalls int
+	bus                *events.Bus
+	addedMagnet        string
+	syncCalls          int
+	processCalls       int
+	pausedTorrentHash  string
+	resumedTorrentHash string
+	pausedConvID       int64
+	resumedConvID      int64
+	pausedUploadID     int64
+	resumedUploadID    int64
 }
 
 func (f *fakeService) VPNStatus(context.Context) (model.VPNState, vpn.Signals, error) {
@@ -43,6 +49,16 @@ func (f *fakeService) AddMagnet(_ context.Context, magnet string) (string, error
 	return "added-id", nil
 }
 
+func (f *fakeService) PauseTorrent(_ context.Context, hash string) error {
+	f.pausedTorrentHash = hash
+	return nil
+}
+
+func (f *fakeService) ResumeTorrent(_ context.Context, hash string) error {
+	f.resumedTorrentHash = hash
+	return nil
+}
+
 func (f *fakeService) SyncCompletedDownloads(context.Context) error {
 	f.syncCalls++
 	return nil
@@ -59,6 +75,26 @@ func (f *fakeService) ListConversionJobs(context.Context) ([]model.ConversionJob
 
 func (f *fakeService) ListUploadJobs(context.Context) ([]model.UploadJob, error) {
 	return []model.UploadJob{{ID: 1}}, nil
+}
+
+func (f *fakeService) PauseConversionJob(_ context.Context, id int64) error {
+	f.pausedConvID = id
+	return nil
+}
+
+func (f *fakeService) ResumeConversionJob(_ context.Context, id int64) error {
+	f.resumedConvID = id
+	return nil
+}
+
+func (f *fakeService) PauseUploadJob(_ context.Context, id int64) error {
+	f.pausedUploadID = id
+	return nil
+}
+
+func (f *fakeService) ResumeUploadJob(_ context.Context, id int64) error {
+	f.resumedUploadID = id
+	return nil
 }
 
 func (f *fakeService) ListLinks(context.Context, int) ([]model.LinkRecord, error) {
@@ -118,7 +154,7 @@ func TestIndexContainsParityActions(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, mustContain := range []string{"add-magnet-form", "run-once-btn", "/api/torrents/add", "/api/run/once", "panel-wide", "torrent-table"} {
+	for _, mustContain := range []string{"add-magnet-form", "run-once-btn", "/api/torrents/add", "/api/run/once", "/api/torrents/action", "/api/conversion/action", "/api/upload/action", "row-context-menu", "pipeline-board", "lane-torrents", "lane-conversion", "lane-upload", "lane-links", "item-card", "function itemCard(", "function renderLane("} {
 		if !strings.Contains(text, mustContain) {
 			t.Fatalf("index missing %q", mustContain)
 		}
@@ -330,6 +366,54 @@ func TestRunOnceEndpoint(t *testing.T) {
 	}
 	if svc.syncCalls != 1 || svc.processCalls != 1 {
 		t.Fatalf("expected one sync and process call, got sync=%d process=%d", svc.syncCalls, svc.processCalls)
+	}
+}
+
+func TestRowActionEndpoints(t *testing.T) {
+	svc := &fakeService{}
+	server := NewServer(svc, "secret", true)
+	ts := httptest.NewServer(server.Handler())
+	defer ts.Close()
+
+	post := func(path string, vals url.Values) {
+		t.Helper()
+		cloned := url.Values{}
+		for k, v := range vals {
+			cloned[k] = append([]string(nil), v...)
+		}
+		vals = cloned
+		vals.Set("csrf_token", "csrf-token")
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(vals.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("X-API-Token", "secret")
+		req.Header.Set("X-CSRF-Token", "csrf-token")
+		req.AddCookie(&http.Cookie{Name: "maxwell_csrf", Value: "csrf-token"})
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("post %s expected 200, got %d body=%s", path, resp.StatusCode, string(b))
+		}
+	}
+
+	post("/api/torrents/action", url.Values{"hash": []string{"hash-1"}, "action": []string{"pause"}})
+	post("/api/torrents/action", url.Values{"hash": []string{"hash-1"}, "action": []string{"resume"}})
+	post("/api/conversion/action", url.Values{"id": []string{"7"}, "action": []string{"pause"}})
+	post("/api/conversion/action", url.Values{"id": []string{"7"}, "action": []string{"resume"}})
+	post("/api/upload/action", url.Values{"id": []string{"9"}, "action": []string{"pause"}})
+	post("/api/upload/action", url.Values{"id": []string{"9"}, "action": []string{"resume"}})
+
+	if svc.pausedTorrentHash != "hash-1" || svc.resumedTorrentHash != "hash-1" {
+		t.Fatalf("torrent action calls not captured: pause=%q resume=%q", svc.pausedTorrentHash, svc.resumedTorrentHash)
+	}
+	if svc.pausedConvID != 7 || svc.resumedConvID != 7 {
+		t.Fatalf("conversion action calls not captured: pause=%d resume=%d", svc.pausedConvID, svc.resumedConvID)
+	}
+	if svc.pausedUploadID != 9 || svc.resumedUploadID != 9 {
+		t.Fatalf("upload action calls not captured: pause=%d resume=%d", svc.pausedUploadID, svc.resumedUploadID)
 	}
 }
 

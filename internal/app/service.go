@@ -110,6 +110,32 @@ func (s *Service) ListTorrents(ctx context.Context) ([]model.Torrent, error) {
 	return s.torrents.List(ctx)
 }
 
+func (s *Service) PauseTorrent(ctx context.Context, hash string) error {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return fmt.Errorf("torrent hash is required")
+	}
+	if err := s.torrents.PauseHashes(ctx, []string{hash}); err != nil {
+		return err
+	}
+	_ = s.store.AddEvent(ctx, "info", "torrent_paused", hash)
+	s.bus.Publish(events.Message{Type: "torrent_paused", Body: hash})
+	return nil
+}
+
+func (s *Service) ResumeTorrent(ctx context.Context, hash string) error {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return fmt.Errorf("torrent hash is required")
+	}
+	if err := s.torrents.ResumeHashes(ctx, []string{hash}); err != nil {
+		return err
+	}
+	_ = s.store.AddEvent(ctx, "info", "torrent_resumed", hash)
+	s.bus.Publish(events.Message{Type: "torrent_resumed", Body: hash})
+	return nil
+}
+
 func (s *Service) AddMagnet(ctx context.Context, magnet string) (string, error) {
 	if strings.TrimSpace(magnet) == "" {
 		return "", fmt.Errorf("magnet is required")
@@ -271,8 +297,76 @@ func (s *Service) ListConversionJobs(ctx context.Context) ([]model.ConversionJob
 	return s.store.ListConversionJobs(ctx)
 }
 
+func (s *Service) PauseConversionJob(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("conversion job id is required")
+	}
+	ok, err := s.store.PauseConversionJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("conversion job %d is not pausable (only queued jobs can be paused)", id)
+	}
+	msg := fmt.Sprintf("conversion job %d paused", id)
+	_ = s.store.AddEvent(ctx, "info", "conversion_paused", msg)
+	s.bus.Publish(events.Message{Type: "conversion_paused", Body: msg})
+	return nil
+}
+
+func (s *Service) ResumeConversionJob(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("conversion job id is required")
+	}
+	ok, err := s.store.ResumeConversionJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("conversion job %d is not resumable (only paused jobs can continue)", id)
+	}
+	msg := fmt.Sprintf("conversion job %d resumed", id)
+	_ = s.store.AddEvent(ctx, "info", "conversion_resumed", msg)
+	s.bus.Publish(events.Message{Type: "conversion_resumed", Body: msg})
+	return nil
+}
+
 func (s *Service) ListUploadJobs(ctx context.Context) ([]model.UploadJob, error) {
 	return s.store.ListUploadJobs(ctx)
+}
+
+func (s *Service) PauseUploadJob(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("upload job id is required")
+	}
+	ok, err := s.store.PauseUploadJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("upload job %d is not pausable (only queued jobs can be paused)", id)
+	}
+	msg := fmt.Sprintf("upload job %d paused", id)
+	_ = s.store.AddEvent(ctx, "info", "upload_paused", msg)
+	s.bus.Publish(events.Message{Type: "upload_paused", Body: msg})
+	return nil
+}
+
+func (s *Service) ResumeUploadJob(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("upload job id is required")
+	}
+	ok, err := s.store.ResumeUploadJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("upload job %d is not resumable (only paused jobs can continue)", id)
+	}
+	msg := fmt.Sprintf("upload job %d resumed", id)
+	_ = s.store.AddEvent(ctx, "info", "upload_resumed", msg)
+	s.bus.Publish(events.Message{Type: "upload_resumed", Body: msg})
+	return nil
 }
 
 func (s *Service) ListLinks(ctx context.Context, limit int) ([]model.LinkRecord, error) {

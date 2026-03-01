@@ -30,10 +30,16 @@ type ServiceAPI interface {
 	VPNStatus(context.Context) (model.VPNState, vpn.Signals, error)
 	ListTorrents(context.Context) ([]model.Torrent, error)
 	AddMagnet(context.Context, string) (string, error)
+	PauseTorrent(context.Context, string) error
+	ResumeTorrent(context.Context, string) error
 	SyncCompletedDownloads(context.Context) error
 	ProcessOnce(context.Context) error
 	ListConversionJobs(context.Context) ([]model.ConversionJob, error)
 	ListUploadJobs(context.Context) ([]model.UploadJob, error)
+	PauseConversionJob(context.Context, int64) error
+	ResumeConversionJob(context.Context, int64) error
+	PauseUploadJob(context.Context, int64) error
+	ResumeUploadJob(context.Context, int64) error
 	ListLinks(context.Context, int) ([]model.LinkRecord, error)
 	ListEvents(context.Context, int) ([]model.Event, error)
 	Stats(context.Context) (map[string]int64, error)
@@ -428,19 +434,57 @@ func (r *Runner) cmdWeb(configPath string, args []string) int {
 			errCh <- err
 		}
 	}()
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	workerDone := startWebPipelineLoop(workerCtx, svc, 4*time.Second, r.Stderr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	select {
 	case <-ctx.Done():
+		workerCancel()
+		<-workerDone
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 		return 0
 	case err := <-errCh:
+		workerCancel()
+		<-workerDone
 		fmt.Fprintf(r.Stderr, "web server: %v\n", err)
 		return 1
 	}
+}
+
+func startWebPipelineLoop(ctx context.Context, svc ServiceAPI, interval time.Duration, stderr io.Writer) <-chan struct{} {
+	done := make(chan struct{})
+	if interval <= 0 {
+		interval = 4 * time.Second
+	}
+	go func() {
+		defer close(done)
+		runOne := func() {
+			stepCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			defer cancel()
+			if err := svc.SyncCompletedDownloads(stepCtx); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "web pipeline sync: %v\n", err)
+			}
+			if err := svc.ProcessOnce(stepCtx); err != nil && stderr != nil {
+				fmt.Fprintf(stderr, "web pipeline process: %v\n", err)
+			}
+		}
+		runOne()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				runOne()
+			}
+		}
+	}()
+	return done
 }
 
 func (r *Runner) printUsage() {

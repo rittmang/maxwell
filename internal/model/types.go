@@ -27,6 +27,7 @@ type JobStatus string
 const (
 	JobStatusQueued  JobStatus = "queued"
 	JobStatusRunning JobStatus = "running"
+	JobStatusPaused  JobStatus = "paused"
 	JobStatusDone    JobStatus = "done"
 	JobStatusFailed  JobStatus = "failed"
 )
